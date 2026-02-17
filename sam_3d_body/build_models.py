@@ -46,6 +46,31 @@ def _hf_download(repo_id):
     return os.path.join(local_dir, "model.ckpt"), os.path.join(local_dir, "assets", "mhr_model.pt")
 
 
+def load_sam_3d_body_local(checkpoint_dir, **kwargs):
+    """Load SAM 3D Body model from local checkpoint directory.
+    
+    Args:
+        checkpoint_dir: Path to local checkpoint directory (e.g., './checkpoints/sam-3d-body-vith')
+        **kwargs: Additional arguments passed to load_sam_3d_body
+    
+    Returns:
+        model, model_cfg: Loaded model and configuration
+    """
+    ckpt_path = os.path.join(checkpoint_dir, "model.ckpt")
+    mhr_path = os.path.join(checkpoint_dir, "assets", "mhr_model.pt")
+    
+    if not os.path.exists(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found at {ckpt_path}")
+    if not os.path.exists(mhr_path):
+        raise FileNotFoundError(f"MHR model not found at {mhr_path}")
+    
+    print(f"CKPT PATH: {ckpt_path}")
+    print(f"MHR PATH: {mhr_path}")
+    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path, **kwargs)
+
+
 def load_sam_3d_body_hf(repo_id, **kwargs):
     ckpt_path, mhr_path = _hf_download(repo_id)
-    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path)
+    print(f"CKPT PATH: {ckpt_path}")
+    print(f"MHR PATH: {mhr_path}")
+    return load_sam_3d_body(checkpoint_path=ckpt_path, mhr_path=mhr_path, **kwargs)

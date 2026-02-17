@@ -2,6 +2,7 @@
 
 from ..modules import to_2tuple
 from .camera_head import PerspectiveHead
+from .contact_head import ContactHead
 from .mhr_head import MHRHead
 
 
@@ -23,6 +24,15 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
                 "MLP_CHANNEL_DIV_FACTOR", 1
             ),
             default_scale_factor=default_scale_factor,
+        )
+    elif head_type == "contact":
+        return ContactHead(
+            input_dim=cfg.MODEL.DECODER.DIM,
+            num_contacts=cfg.MODEL.get("CONTACT_HEAD", dict()).get("NUM_CONTACTS", 4),
+            mlp_depth=cfg.MODEL.get("CONTACT_HEAD", dict()).get("MLP_DEPTH", 2),
+            mlp_channel_div_factor=cfg.MODEL.get("CONTACT_HEAD", dict()).get(
+                "MLP_CHANNEL_DIV_FACTOR", 4
+            ),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)

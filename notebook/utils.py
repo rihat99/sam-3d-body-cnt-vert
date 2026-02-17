@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
-from sam_3d_body import load_sam_3d_body_hf, SAM3DBodyEstimator
+from sam_3d_body import load_sam_3d_body_hf, load_sam_3d_body_local, SAM3DBodyEstimator
 from sam_3d_body.metadata.mhr70 import pose_info as mhr70_pose_info
 from sam_3d_body.visualization.renderer import Renderer
 from sam_3d_body.visualization.skeleton_visualizer import SkeletonVisualizer
@@ -19,7 +19,8 @@ LIGHT_BLUE = (0.65098039, 0.74117647, 0.85882353)
 
 
 def setup_sam_3d_body(
-    hf_repo_id: str = "facebook/sam-3d-body-vith",
+    checkpoint_dir: str = None,
+    hf_repo_id: str = None,
     detector_name: str = "vitdet",
     segmentor_name: str = "sam2",
     fov_name: str = "moge2",
@@ -32,7 +33,9 @@ def setup_sam_3d_body(
     Set up SAM 3D Body estimator with optional components.
 
     Args:
-        hf_repo_id: HuggingFace repository ID for the model
+        checkpoint_dir: Path to local checkpoint directory (e.g., './checkpoints/sam-3d-body-vith').
+                       Takes priority over hf_repo_id if both are provided.
+        hf_repo_id: HuggingFace repository ID for the model (used only if checkpoint_dir is None)
         detector_name: Name of detector to use (default: "vitdet")
         segmentor_name: Name of segmentor to use (default: "sam2")
         fov_name: Name of FOV estimator to use (default: "moge2")
@@ -44,14 +47,19 @@ def setup_sam_3d_body(
     Returns:
         estimator: SAM3DBodyEstimator instance ready for inference
     """
-    print(f"Loading SAM 3D Body model from {hf_repo_id}...")
-
     # Auto-detect device if not specified
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Load core model from HuggingFace
-    model, model_cfg = load_sam_3d_body_hf(hf_repo_id, device=device)
+    # Load core model from local checkpoint or HuggingFace
+    if checkpoint_dir is not None:
+        print(f"Loading SAM 3D Body model from local checkpoint: {checkpoint_dir}...")
+        model, model_cfg = load_sam_3d_body_local(checkpoint_dir, device=device)
+    elif hf_repo_id is not None:
+        print(f"Loading SAM 3D Body model from HuggingFace: {hf_repo_id}...")
+        model, model_cfg = load_sam_3d_body_hf(hf_repo_id, device=device)
+    else:
+        raise ValueError("Either checkpoint_dir or hf_repo_id must be provided")
 
     # Initialize optional components
     human_detector, human_segmentor, fov_estimator = None, None, None

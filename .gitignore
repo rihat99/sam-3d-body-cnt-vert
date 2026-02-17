@@ -119,3 +119,8 @@ debug/
 **/.dist_test
 sandbox*
 *.sh
+
+dataset
+images
+output
+*inference_samples

@@ -194,6 +194,40 @@ class SAM3DBody(BaseModel):
                 self.cfg.MODEL.DECODER.DIM, self.cfg.MODEL.DECODER.DIM, 4, 3
             )
 
+        # Contact prediction head and tokens
+        if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+            self.num_contact_tokens = self.cfg.MODEL.get("CONTACT_HEAD", dict()).get(
+                "NUM_CONTACTS", 4
+            )
+            # Learnable query tokens for contact prediction
+            # Index 0: Left foot, 1: Right foot, 2: Left hand, 3: Right hand
+            self.contact_embedding = nn.Embedding(
+                self.num_contact_tokens, self.cfg.MODEL.DECODER.DIM
+            )
+            # Contact prediction head
+            self.head_contact = build_head(self.cfg, "contact")
+
+            # --- Contact token update layers (Idea 3: PE + feature sampling) ---
+            # MHR70 keypoint indices corresponding to each contact token:
+            #   Contact 0 (Left foot)  -> left-ankle  = MHR70 index 13
+            #   Contact 1 (Right foot) -> right-ankle = MHR70 index 14
+            #   Contact 2 (Left hand)  -> left-wrist  = MHR70 index 62
+            #   Contact 3 (Right hand) -> right-wrist = MHR70 index 41
+            self.contact_keypoint_indices = [13, 14, 62, 41]
+
+            # Positional encoding: project 2D keypoint position -> decoder dim
+            self.contact_posemb_linear = FFN(
+                embed_dims=2,
+                feedforward_channels=self.cfg.MODEL.DECODER.DIM,
+                output_dims=self.cfg.MODEL.DECODER.DIM,
+                num_fcs=2,
+                add_identity=False,
+            )
+            # Feature projection: project sampled image features -> decoder dim
+            self.contact_feat_linear = nn.Linear(
+                self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
+            )
+
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
             feedforward_channels=self.cfg.MODEL.DECODER.DIM,
@@ -460,6 +494,29 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )  # B x 3 + 70 + 70 x 1024
 
+            # Add contact tokens if enabled
+            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+                contact_emb_start_idx = token_embeddings.shape[1]
+                token_embeddings = torch.cat(
+                    [
+                        token_embeddings,
+                        self.contact_embedding.weight[None, :, :].repeat(
+                            batch_size, 1, 1
+                        ),
+                    ],
+                    dim=1,
+                )
+                # No positional embeddings for contact tokens
+                token_augment = torch.cat(
+                    [
+                        token_augment,
+                        torch.zeros_like(
+                            token_embeddings[:, token_augment.shape[1] :, :]
+                        ),
+                    ],
+                    dim=1,
+                )
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -489,12 +546,23 @@ class SAM3DBody(BaseModel):
         # Now for 3D
         kp3d_token_update_fn = self.keypoint3d_token_update_fn
 
-        # Combine the 2D and 3D functionse
+        # Contact token update (PE + image feature sampling at wrist/ankle locations)
+        ct_token_update_fn = (
+            self.contact_token_update_fn
+            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
+            else None
+        )
+
+        # Combine the 2D, 3D, and contact update functions
         def keypoint_token_update_fn_comb(*args):
             if kp_token_update_fn is not None:
                 args = kp_token_update_fn(kps_emb_start_idx, image_embeddings, *args)
             if kp3d_token_update_fn is not None:
                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
+            if ct_token_update_fn is not None:
+                args = ct_token_update_fn(
+                    contact_emb_start_idx, image_embeddings, self.decoder.layers, *args
+                )
             return args
 
         pose_token, pose_output = self.decoder(
@@ -507,13 +575,26 @@ class SAM3DBody(BaseModel):
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
         )
 
+        # Process contact tokens if enabled
+        contact_output = None
+        if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+            contact_tokens = pose_token[
+                :, contact_emb_start_idx : contact_emb_start_idx + self.num_contact_tokens
+            ]
+            contact_logits = self.head_contact(contact_tokens)
+            contact_output = {
+                "contact_logits": contact_logits,  # [B, 4] - logits for each contact
+                "contact_probs": torch.sigmoid(contact_logits),  # [B, 4] - probabilities
+            }
+
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
                 pose_output,
+                contact_output,
             )
         else:
-            return pose_token, pose_output
+            return pose_token, pose_output, contact_output
 
     def forward_decoder_hand(
         self,
@@ -692,6 +773,29 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )  # B x 3 + 70 + 70 x 1024
 
+            # Add contact tokens if enabled
+            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+                contact_emb_start_idx_hand = token_embeddings.shape[1]
+                token_embeddings = torch.cat(
+                    [
+                        token_embeddings,
+                        self.contact_embedding.weight[None, :, :].repeat(
+                            batch_size, 1, 1
+                        ),
+                    ],
+                    dim=1,
+                )
+                # No positional embeddings for contact tokens
+                token_augment = torch.cat(
+                    [
+                        token_augment,
+                        torch.zeros_like(
+                            token_embeddings[:, token_augment.shape[1] :, :]
+                        ),
+                    ],
+                    dim=1,
+                )
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -722,12 +826,23 @@ class SAM3DBody(BaseModel):
         # Now for 3D
         kp3d_token_update_fn = self.keypoint3d_token_update_fn_hand
 
-        # Combine the 2D and 3D functionse
+        # Contact token update (PE + image feature sampling at wrist/ankle locations)
+        ct_token_update_fn = (
+            self.contact_token_update_fn
+            if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False)
+            else None
+        )
+
+        # Combine the 2D, 3D, and contact update functions
         def keypoint_token_update_fn_comb(*args):
             if kp_token_update_fn is not None:
                 args = kp_token_update_fn(kps_emb_start_idx, image_embeddings, *args)
             if kp3d_token_update_fn is not None:
                 args = kp3d_token_update_fn(kps3d_emb_start_idx, *args)
+            if ct_token_update_fn is not None:
+                args = ct_token_update_fn(
+                    contact_emb_start_idx_hand, image_embeddings, self.decoder_hand.layers, *args
+                )
             return args
 
         pose_token, pose_output = self.decoder_hand(
@@ -740,13 +855,26 @@ class SAM3DBody(BaseModel):
             keypoint_token_update_fn=keypoint_token_update_fn_comb,
         )
 
+        # Process contact tokens if enabled
+        contact_output = None
+        if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
+            contact_tokens = pose_token[
+                :, contact_emb_start_idx_hand : contact_emb_start_idx_hand + self.num_contact_tokens
+            ]
+            contact_logits = self.head_contact(contact_tokens)
+            contact_output = {
+                "contact_logits": contact_logits,  # [B, 4] - logits for each contact
+                "contact_probs": torch.sigmoid(contact_logits),  # [B, 4] - probabilities
+            }
+
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
             return (
                 pose_token[:, hand_det_emb_start_idx : hand_det_emb_start_idx + 2],
                 pose_output,
+                contact_output,
             )
         else:
-            return pose_token, pose_output
+            return pose_token, pose_output, contact_output
 
     @torch.no_grad()
     def _get_keypoint_prompt(self, batch, pred_keypoints_2d, force_dummy=False):
@@ -867,8 +995,9 @@ class SAM3DBody(BaseModel):
             cur_keypoint_prompt = keypoint_prompt  # [B, 1, 3]
 
         pose_output, pose_output_hand = None, None
+        contact_output = None
         if len(self.body_batch_idx):
-            tokens_output, pose_output = self.forward_decoder(
+            tokens_output, pose_output, contact_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,  # not recurring previous estimate
                 keypoints=cur_keypoint_prompt[self.body_batch_idx],
@@ -884,6 +1013,7 @@ class SAM3DBody(BaseModel):
             {
                 "mhr": pose_output,
                 "mhr_hand": pose_output_hand,
+                "contact": contact_output,
             }
         )
 
@@ -1120,8 +1250,9 @@ class SAM3DBody(BaseModel):
 
         # Forward promptable decoder to get updated pose tokens and regression output
         pose_output, pose_output_hand = None, None
+        contact_output, contact_output_hand = None, None
         if len(self.body_batch_idx):
-            tokens_output, pose_output = self.forward_decoder(
+            tokens_output, pose_output, contact_output = self.forward_decoder(
                 image_embeddings[self.body_batch_idx],
                 init_estimate=None,
                 keypoints=keypoints_prompt[self.body_batch_idx],
@@ -1131,7 +1262,7 @@ class SAM3DBody(BaseModel):
             )
             pose_output = pose_output[-1]
         if len(self.hand_batch_idx):
-            tokens_output_hand, pose_output_hand = self.forward_decoder_hand(
+            tokens_output_hand, pose_output_hand, contact_output_hand = self.forward_decoder_hand(
                 image_embeddings[self.hand_batch_idx],
                 init_estimate=None,
                 keypoints=keypoints_prompt[self.hand_batch_idx],
@@ -1145,6 +1276,8 @@ class SAM3DBody(BaseModel):
             # "pose_token": pose_token,
             "mhr": pose_output,  # mhr prediction output
             "mhr_hand": pose_output_hand,  # mhr prediction output
+            "contact": contact_output,  # contact prediction output
+            "contact_hand": contact_output_hand,  # contact prediction for hand decoder
             "condition_info": condition_info,
             "image_embeddings": image_embeddings,
         }
@@ -1667,7 +1800,7 @@ class SAM3DBody(BaseModel):
                 dim=-1,
             )
 
-        tokens_output, pose_output = self.forward_decoder(
+        tokens_output, pose_output, contact_output = self.forward_decoder(
             image_embeddings,
             init_estimate=None,  # not recurring previous estimate
             keypoints=keypoint_prompt,
@@ -1677,7 +1810,7 @@ class SAM3DBody(BaseModel):
         )
         pose_output = pose_output[-1]
 
-        output.update({"mhr": pose_output})
+        output.update({"mhr": pose_output, "contact": contact_output})
         return output, keypoint_prompt
 
     def _get_hand_box(self, pose_output, batch):
@@ -1887,6 +2020,98 @@ class SAM3DBody(BaseModel):
             kps3d_emb_start_idx : kps3d_emb_start_idx + num_keypoints3d,
             :,
         ] = self.keypoint3d_posemb_linear(pred_keypoints_3d)
+
+        return token_embeddings, token_augment, pose_output, layer_idx
+
+    def contact_token_update_fn(
+        self,
+        contact_emb_start_idx,
+        image_embeddings,
+        decoder_layers,
+        token_embeddings,
+        token_augment,
+        pose_output,
+        layer_idx,
+    ):
+        """
+        Update contact tokens after each intermediate decoder layer.
+
+        Mirrors the keypoint token update mechanism:
+        1. Updates positional encoding (token_augment) with predicted 2D positions
+           of the corresponding body part (wrist/ankle).
+        2. Samples image features at those 2D positions via grid_sample and adds
+           them to the contact token embeddings.
+
+        Contact token ordering (from contact_head.py):
+            0: Left foot   -> left-ankle   (MHR70 idx 13)
+            1: Right foot  -> right-ankle  (MHR70 idx 14)
+            2: Left hand   -> left-wrist   (MHR70 idx 62)
+            3: Right hand  -> right-wrist  (MHR70 idx 41)
+        """
+        # Skip after the last layer (same pattern as keypoint_token_update_fn)
+        if layer_idx == len(decoder_layers) - 1:
+            return token_embeddings, token_augment, pose_output, layer_idx
+
+        num_ct = self.num_contact_tokens
+        kp_indices = self.contact_keypoint_indices  # [13, 14, 62, 41]
+
+        # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
+        pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]
+        pred_kps_depth = pose_output["pred_keypoints_2d_depth"].clone()  # [B, 70]
+
+        # Select the 4 keypoints corresponding to contact tokens
+        contact_kps_2d = pred_kps_2d[:, kp_indices]  # [B, 4, 2]
+        contact_kps_depth = pred_kps_depth[:, kp_indices]  # [B, 4]
+
+        # Validity check: outside image bounds or behind camera
+        contact_kps_01 = contact_kps_2d + 0.5  # convert to 0-1 range
+        invalid_mask = (
+            (contact_kps_01[:, :, 0] < 0)
+            | (contact_kps_01[:, :, 0] > 1)
+            | (contact_kps_01[:, :, 1] < 0)
+            | (contact_kps_01[:, :, 1] > 1)
+            | (contact_kps_depth < 1e-5)
+        )  # [B, 4]
+
+        # --- 1. Update positional encoding ---
+        token_augment = token_augment.clone()
+        token_augment[
+            :, contact_emb_start_idx : contact_emb_start_idx + num_ct, :
+        ] = (
+            self.contact_posemb_linear(contact_kps_2d)
+            * (~invalid_mask[:, :, None])
+        )
+
+        # --- 2. Sample image features at predicted body part locations ---
+        # Convert from [-0.5, 0.5] to [-1, 1] for grid_sample
+        sample_points = contact_kps_2d * 2
+        # Handle backbone-specific coordinate adjustments
+        if self.cfg.MODEL.BACKBONE.TYPE in [
+            "vit_hmr", "vit", "vit_b", "vit_l", "vit_hmr_512_384",
+        ]:
+            sample_points[:, :, 0] = sample_points[:, :, 0] / 12 * 16
+
+        # Bilinear sampling: [B, C, H, W] + [B, 4, 1, 2] -> [B, C, 4, 1]
+        sampled_feats = (
+            F.grid_sample(
+                image_embeddings,
+                sample_points[:, :, None, :],  # [B, 4, 1, 2]
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            .squeeze(3)
+            .permute(0, 2, 1)
+        )  # [B, 4, C_backbone]
+
+        # Zero out features for invalid locations
+        sampled_feats = sampled_feats * (~invalid_mask[:, :, None])
+
+        # Project from backbone dim to decoder dim and add to contact tokens
+        token_embeddings = token_embeddings.clone()
+        token_embeddings[
+            :, contact_emb_start_idx : contact_emb_start_idx + num_ct, :
+        ] += self.contact_feat_linear(sampled_feats)
 
         return token_embeddings, token_augment, pose_output, layer_idx
 

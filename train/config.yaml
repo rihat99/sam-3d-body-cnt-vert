@@ -1,0 +1,96 @@
+MODEL:
+  CHECKPOINT_PATH: /home/rikhat/human_global_motion/sam-3d-body/checkpoints/sam-3d-body-dinov3/model.ckpt
+  MHR_MODEL_PATH: /home/rikhat/human_global_motion/sam-3d-body/checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+  IMAGE_SIZE:
+  - 896
+  - 896
+  IMAGE_MEAN:
+  - 0.485
+  - 0.456
+  - 0.406
+  IMAGE_STD:
+  - 0.229
+  - 0.224
+  - 0.225
+  BACKBONE:
+    TYPE: dinov3_vith16plus  # DINOv3 ViT-H/16+ for maximum detail at high resolution
+    FROZEN: true
+    DROP_PATH_RATE: 0.1
+  DECODER:
+    DIM: 1024
+    FROZEN: true
+    DO_CONTACT_TOKENS: true
+    DO_KEYPOINT_TOKENS: true
+    DO_KEYPOINT3D_TOKENS: true
+    CONDITION_TYPE: cliff
+    USE_INTRIN_CENTER: false
+  CONTACT_HEAD:
+    NUM_CONTACTS: 4
+    MLP_DEPTH: 2
+    MLP_CHANNEL_DIV_FACTOR: 4
+  PROMPT_ENCODER:
+    ENABLE: true
+    MAX_NUM_CLICKS: 1
+    PROMPT_KEYPOINTS: mhr70
+    MASK_EMBED_TYPE: null
+  MHR_HEAD:
+    MHR_MODEL_PATH: ''
+    MLP_DEPTH: 1
+    MLP_CHANNEL_DIV_FACTOR: 1
+  PERSON_HEAD:
+    POSE_TYPE: mhr
+    CAMERA_TYPE: perspective
+  CAMERA_HEAD:
+    MLP_DEPTH: 1
+    MLP_CHANNEL_DIV_FACTOR: 1
+    DEFAULT_SCALE_FACTOR: 1.0
+TRAIN:
+  BATCH_SIZE: 32  # Small batch for very high resolution (896x896)
+  VAL_BATCH_SIZE: 32
+  NUM_WORKERS: 4
+  EPOCHS: 20
+  LR: 1e-4
+  WEIGHT_DECAY: 1e-4
+  LR_SCHEDULER: cosine
+  LR_WARMUP_EPOCHS: 0
+  LR_MIN: 1e-6
+  USE_FP16: false  # Disabled: MHR model's sparse operations don't support mixed precision
+  FP16_TYPE: float32
+  GRAD_CLIP: 1.0
+  LOSS_WEIGHTS:
+    hand: 1.0
+    foot: 1.0
+  POS_WEIGHT: null
+  SAVE_FREQ: 5
+  VAL_FREQ: 1
+  RESUME: null
+DATASET:
+  DATA_PATH: /home/rikhat/climbing/climb_forces/data/eth
+  TRAIN_FOLDERS:
+  - '1'
+  - '2'
+  VAL_FOLDERS: []
+  SIDES:
+  - left
+  - right
+  TRAIN_VAL_SPLIT: 0.8
+  CONTACT_THRESHOLD: 50
+  SEED: 42
+  USE_CACHE: true
+  REBUILD_CACHE: false
+OUTPUT:
+  DIR: ./train/output
+  EXP_NAME: contact_head_eth
+  LOG_FREQ: 10
+  USE_TENSORBOARD: true
+CAMERA:
+  fx: 1419.27383
+  fy: 1419.21058
+  cx: 966.397807
+  cy: 498.565941
+  dist:
+  - 0.03452283
+  - -0.18056709
+  - -0.00329048
+  - -0.00233279
+  - 0.13364379
