@@ -12,6 +12,7 @@ root = pyrootutils.setup_root(
     dotenv=True,
 )
 
+
 import cv2
 import numpy as np
 import torch
