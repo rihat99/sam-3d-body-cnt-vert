@@ -613,10 +613,17 @@ class TransformerDecoderLayer(nn.Module):
 
         attn_mask = None
         if x_mask is not None:
-            attn_mask = x_mask[:, :, None] @ x_mask[:, None, :]
-            # Set diagonal to 1 to prevent nan output
-            attn_mask.diagonal(dim1=1, dim2=2).fill_(1)
-            attn_mask = attn_mask > 0
+            if x_mask.dim() == 3:
+                # Pre-computed asymmetric mask [B, N, N]: used when some tokens (e.g.
+                # contact tokens) should not be visible to frozen tokens as keys, but
+                # contact tokens themselves can still attend to all other tokens.
+                attn_mask = x_mask
+            else:
+                # 1D mask [B, N] -> symmetric outer-product [B, N, N]
+                attn_mask = x_mask[:, :, None] @ x_mask[:, None, :]
+                # Set diagonal to 1 to prevent nan output
+                attn_mask.diagonal(dim1=1, dim2=2).fill_(1)
+                attn_mask = attn_mask > 0
         x = x + self.self_attn(q=q, k=k, v=v, attn_mask=attn_mask)
 
         # Cross attention block, tokens attending to image embedding
@@ -641,11 +648,17 @@ class TransformerDecoderLayer(nn.Module):
             else:
                 q = self.ln4_1(context)
                 k = v = self.ln4_2(x)
-            attn_mask = (
-                (x_mask[:, None, :].repeat(1, context.shape[1], 1)) > 0
-                if x_mask is not None
-                else None
-            )
+            if x_mask is None:
+                attn_mask = None
+            elif x_mask.dim() == 3:
+                # Image pixels should not attend to tokens that NO frozen token can see
+                # (i.e. contact tokens). Using all(dim=1) gives the intersection of
+                # visible keys across all queries.
+                attn_mask = x_mask.all(dim=1, keepdim=True).expand(
+                    -1, context.shape[1], -1
+                )
+            else:
+                attn_mask = (x_mask[:, None, :].repeat(1, context.shape[1], 1)) > 0
             context = context + self.cross_attn_2(q=q, k=k, v=v, attn_mask=attn_mask)
 
         return x, context

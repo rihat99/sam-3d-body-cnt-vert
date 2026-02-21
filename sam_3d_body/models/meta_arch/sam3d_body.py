@@ -517,6 +517,17 @@ class SAM3DBody(BaseModel):
                     dim=1,
                 )
 
+                # Asymmetric attention mask: frozen tokens must not attend to contact
+                # tokens (to avoid polluting their representations), but contact tokens
+                # can still attend to all other tokens to learn from them.
+                N_total = token_embeddings.shape[1]
+                token_mask = torch.ones(
+                    batch_size, N_total, N_total,
+                    dtype=torch.bool,
+                    device=token_embeddings.device,
+                )
+                token_mask[:, :contact_emb_start_idx, contact_emb_start_idx:] = False
+
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):
             # Get the pose token
@@ -795,6 +806,17 @@ class SAM3DBody(BaseModel):
                     ],
                     dim=1,
                 )
+
+                # Asymmetric attention mask: frozen tokens must not attend to contact
+                # tokens (to avoid polluting their representations), but contact tokens
+                # can still attend to all other tokens to learn from them.
+                N_total = token_embeddings.shape[1]
+                token_mask = torch.ones(
+                    batch_size, N_total, N_total,
+                    dtype=torch.bool,
+                    device=token_embeddings.device,
+                )
+                token_mask[:, :contact_emb_start_idx_hand, contact_emb_start_idx_hand:] = False
 
         # We're doing intermediate model predictions
         def token_to_pose_output_fn(tokens, prev_pose_output, layer_idx):

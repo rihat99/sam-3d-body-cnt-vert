@@ -35,8 +35,13 @@ from dataset_utils import prepare_training_batch
 class ContactEvaluator:
     """Evaluator for contact head"""
     
-    def __init__(self, config_path, checkpoint_path, device="cuda"):
+    def __init__(self, config_path, checkpoint_path, split="val", device="cuda"):
         self.device = device
+        self.split = split  # "train" or "val"
+
+        # Output directory for figures
+        self.figures_dir = Path(__file__).parent / "figures"
+        self.figures_dir.mkdir(parents=True, exist_ok=True)
         
         # Load config
         self.cfg = get_config(config_path)
@@ -59,48 +64,69 @@ class ContactEvaluator:
         
         self.model.eval()
         
-        # Load validation dataset
-        print("Loading validation dataset...")
+        # Load dataset
+        print(f"Loading {split} dataset...")
         self.setup_dataset()
         
         # Contact names for reporting
         self.contact_names = ['Left Hand', 'Right Hand', 'Left Foot', 'Right Foot']
     
     def setup_dataset(self):
-        """Setup validation dataset"""
-        if self.cfg.DATASET.VAL_FOLDERS:
-            # Use separate validation folders
-            val_dataset = ETHContactDataset(
+        """Setup dataset using the same split strategy as training.
+
+        Respects self.split ("train" or "val") so that either half can be
+        evaluated independently.
+        """
+        train_videos = self.cfg.DATASET.get('TRAIN_VIDEOS') or None
+        val_videos   = self.cfg.DATASET.get('VAL_VIDEOS')   or None
+
+        if train_videos and val_videos:
+            # Explicit per-video lists
+            videos = train_videos if self.split == 'train' else val_videos
+            dataset = ETHContactDataset(
+                data_path=self.cfg.DATASET.DATA_PATH,
+                folders=self.cfg.DATASET.TRAIN_FOLDERS,
+                videos=videos,
+                sides=self.cfg.DATASET.SIDES,
+                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
+                rebuild_cache=False
+            )
+        elif self.cfg.DATASET.VAL_FOLDERS and self.split == 'val':
+            # Folder-level split — only applies to val
+            dataset = ETHContactDataset(
                 data_path=self.cfg.DATASET.DATA_PATH,
                 folders=self.cfg.DATASET.VAL_FOLDERS,
                 sides=self.cfg.DATASET.SIDES,
                 contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
                 rebuild_cache=False
             )
-        else:
-            # Use split from training dataset
-            from torch.utils.data import random_split
-            
-            full_dataset = ETHContactDataset(
+        elif self.cfg.DATASET.VAL_FOLDERS and self.split == 'train':
+            # Folder-level split — train side
+            dataset = ETHContactDataset(
                 data_path=self.cfg.DATASET.DATA_PATH,
                 folders=self.cfg.DATASET.TRAIN_FOLDERS,
                 sides=self.cfg.DATASET.SIDES,
                 contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
                 rebuild_cache=False
             )
-            
-            total_size = len(full_dataset)
-            train_size = int(total_size * self.cfg.DATASET.TRAIN_VAL_SPLIT)
-            val_size = total_size - train_size
-            
-            # Use the same random seed as training to get the exact same validation set
-            torch.manual_seed(self.cfg.DATASET.SEED)
-            _, val_dataset = random_split(full_dataset, [train_size, val_size])
-        
-        print(f"Validation samples: {len(val_dataset)}")
-        
+        else:
+            # Video-level split — reproduce the same split as training
+            video_split_ratio = self.cfg.DATASET.get('VIDEO_SPLIT_RATIO', 0.8)
+            train_dataset, val_dataset = ETHContactDataset.split_by_videos(
+                val_ratio=1.0 - video_split_ratio,
+                seed=self.cfg.DATASET.SEED,
+                data_path=self.cfg.DATASET.DATA_PATH,
+                folders=self.cfg.DATASET.TRAIN_FOLDERS,
+                sides=self.cfg.DATASET.SIDES,
+                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
+                rebuild_cache=False
+            )
+            dataset = train_dataset if self.split == 'train' else val_dataset
+
+        print(f"{self.split.capitalize()} samples: {len(dataset)}")
+
         self.val_loader = DataLoader(
-            val_dataset,
+            dataset,
             batch_size=self.cfg.TRAIN.VAL_BATCH_SIZE,
             shuffle=False,
             num_workers=self.cfg.TRAIN.NUM_WORKERS,
@@ -237,8 +263,9 @@ class ContactEvaluator:
             ax.set_xlabel('Predicted')
         
         plt.tight_layout()
-        plt.savefig('confusion_matrices.png', dpi=150, bbox_inches='tight')
-        print(f"\nSaved confusion matrices to confusion_matrices.png")
+        out_path = self.figures_dir / f"{self.split}_confusion_matrices.png"
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        print(f"\nSaved confusion matrices to {out_path}")
         plt.close()
     
     def plot_probability_distributions(self, probabilities, ground_truth):
@@ -264,8 +291,9 @@ class ContactEvaluator:
             ax.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig('probability_distributions.png', dpi=150, bbox_inches='tight')
-        print(f"Saved probability distributions to probability_distributions.png")
+        out_path = self.figures_dir / f"{self.split}_probability_distributions.png"
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        print(f"Saved probability distributions to {out_path}")
         plt.close()
     
     def plot_roc_curves(self, probabilities, ground_truth):
@@ -339,8 +367,9 @@ class ContactEvaluator:
                        bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
-        plt.savefig('roc_curves.png', dpi=150, bbox_inches='tight')
-        print(f"\nSaved ROC curves to roc_curves.png")
+        out_path = self.figures_dir / f"{self.split}_roc_curves.png"
+        plt.savefig(out_path, dpi=150, bbox_inches='tight')
+        print(f"\nSaved ROC curves to {out_path}")
         
         # Print AUC summary
         print("\n" + "="*80)
@@ -372,6 +401,13 @@ def main():
         help="Path to trained checkpoint (e.g., train/output/contact_head_eth/best_model.pth)"
     )
     parser.add_argument(
+        "--split",
+        type=str,
+        default="val",
+        choices=["train", "val"],
+        help="Which data split to evaluate on (default: val)"
+    )
+    parser.add_argument(
         "--threshold",
         type=float,
         default=0.5,
@@ -386,7 +422,9 @@ def main():
     args = parser.parse_args()
     
     # Create evaluator
-    evaluator = ContactEvaluator(args.config, args.checkpoint, device=args.device)
+    evaluator = ContactEvaluator(
+        args.config, args.checkpoint, split=args.split, device=args.device
+    )
     
     # Run evaluation
     predictions, ground_truth, probabilities = evaluator.evaluate(threshold=args.threshold)

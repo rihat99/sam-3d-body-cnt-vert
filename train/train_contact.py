@@ -11,7 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 import argparse
@@ -130,9 +130,31 @@ class ContactTrainer:
     
     def setup_datasets(self):
         """Setup training and validation datasets"""
-        # Determine train/val split
-        if self.cfg.DATASET.VAL_FOLDERS:
-            # Use separate folders for validation
+        train_videos = self.cfg.DATASET.get('TRAIN_VIDEOS') or None
+        val_videos   = self.cfg.DATASET.get('VAL_VIDEOS')   or None
+
+        if train_videos and val_videos:
+            # Explicit per-video train/val lists
+            print("Using explicit TRAIN_VIDEOS / VAL_VIDEOS split.")
+            train_dataset = ETHContactDataset(
+                data_path=self.cfg.DATASET.DATA_PATH,
+                folders=self.cfg.DATASET.TRAIN_FOLDERS,
+                videos=train_videos,
+                sides=self.cfg.DATASET.SIDES,
+                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
+                rebuild_cache=self.cfg.DATASET.REBUILD_CACHE
+            )
+            val_dataset = ETHContactDataset(
+                data_path=self.cfg.DATASET.DATA_PATH,
+                folders=self.cfg.DATASET.TRAIN_FOLDERS,
+                videos=val_videos,
+                sides=self.cfg.DATASET.SIDES,
+                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
+                rebuild_cache=self.cfg.DATASET.REBUILD_CACHE
+            )
+        elif self.cfg.DATASET.VAL_FOLDERS:
+            # Separate folders for validation
+            print("Using folder-level train/val split.")
             train_dataset = ETHContactDataset(
                 data_path=self.cfg.DATASET.DATA_PATH,
                 folders=self.cfg.DATASET.TRAIN_FOLDERS,
@@ -148,24 +170,17 @@ class ContactTrainer:
                 rebuild_cache=self.cfg.DATASET.REBUILD_CACHE
             )
         else:
-            # Split single dataset
-            full_dataset = ETHContactDataset(
+            # Video-level split: model trained on some videos, evaluated on others
+            video_split_ratio = self.cfg.DATASET.get('VIDEO_SPLIT_RATIO', 0.8)
+            print(f"Using video-level train/val split (train ratio={video_split_ratio}).")
+            train_dataset, val_dataset = ETHContactDataset.split_by_videos(
+                val_ratio=1.0 - video_split_ratio,
+                seed=self.cfg.DATASET.SEED,
                 data_path=self.cfg.DATASET.DATA_PATH,
                 folders=self.cfg.DATASET.TRAIN_FOLDERS,
                 sides=self.cfg.DATASET.SIDES,
                 contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
                 rebuild_cache=self.cfg.DATASET.REBUILD_CACHE
-            )
-            
-            # Compute split sizes
-            total_size = len(full_dataset)
-            train_size = int(total_size * self.cfg.DATASET.TRAIN_VAL_SPLIT)
-            val_size = total_size - train_size
-            
-            # Set random seed for reproducibility
-            torch.manual_seed(self.cfg.DATASET.SEED)
-            train_dataset, val_dataset = random_split(
-                full_dataset, [train_size, val_size]
             )
         
         print(f"Training samples: {len(train_dataset)}")
@@ -197,11 +212,7 @@ class ContactTrainer:
         """Log statistics about the dataset to identify potential issues"""
         print("\n=== Dataset Statistics ===")
         
-        # Get the underlying dataset (handle random_split wrapper)
-        if hasattr(self.train_dataset, 'dataset'):
-            train_ds = self.train_dataset.dataset
-        else:
-            train_ds = self.train_dataset
+        train_ds = self.train_dataset
             
         if hasattr(train_ds, 'samples'):
             samples = train_ds.samples
