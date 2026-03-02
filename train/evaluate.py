@@ -1,435 +1,277 @@
 """
-Evaluation script for trained contact head
+Evaluation script for the per-vertex Contact Head on DAMON dataset.
 
-This script evaluates a trained contact head on the validation set and computes:
-- Overall accuracy
-- Per-contact accuracy (left/right hand, left/right foot)
-- Precision, recall, F1 score
-- Confusion matrix
+Evaluates a trained checkpoint on any of the three splits (train / val / test)
+and reports:
+  - Overall per-vertex accuracy, precision, recall, F1, IoU
+  - Per-sample IoU histogram
+  - Probability distribution (contact vs no-contact)
+  - ROC curve + AUC
+
+Usage:
+    python train/evaluate.py \
+        --config train/config.yaml \
+        --checkpoint train/output/contact_vert_20260222_123456/best_model.pth \
+        --split val
 """
 
 import os
 import sys
+import argparse
 from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-import argparse
 import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import roc_curve, auc
 
-# Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "dataset" / "eth"))
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.utils.config import get_config
-from dataset import ETHContactDataset
-from dataset_utils import prepare_training_batch
+from damon_mhr import DamonMHRDataset
+from dataset_utils import prepare_damon_batch
+from train_contact import damon_collate
 
+
+# ---------------------------------------------------------------------------
 
 class ContactEvaluator:
-    """Evaluator for contact head"""
-    
-    def __init__(self, config_path, checkpoint_path, split="val", device="cuda"):
-        self.device = device
-        self.split = split  # "train" or "val"
+    """Evaluates per-vertex contact prediction on DAMON dataset."""
 
-        # Output directory for figures
+    def __init__(self, config_path: str, checkpoint_path: str,
+                 split: str = "val", device: str = "cuda"):
+        self.device = device
+        self.split = split
+
         self.figures_dir = Path(__file__).parent / "figures"
         self.figures_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Load config
+
         self.cfg = get_config(config_path)
-        
-        # Load base model
+
+        # Load model
         print("Loading SAM-3D-Body model...")
-        self.model, self.model_cfg = load_sam_3d_body(
+        self.model, _ = load_sam_3d_body(
             checkpoint_path=self.cfg.MODEL.CHECKPOINT_PATH,
             device=device,
-            mhr_path=self.cfg.MODEL.MHR_MODEL_PATH
+            mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
-        
-        # Load trained contact head weights
-        print(f"Loading trained contact head from {checkpoint_path}")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        if 'model_state_dict' in checkpoint:
-            self.model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        else:
-            self.model.load_state_dict(checkpoint, strict=False)
-        
+
+        # Load checkpoint
+        print(f"Loading checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location=device)
+        state = ckpt.get('model_state_dict', ckpt)
+        self.model.load_state_dict(state, strict=False)
         self.model.eval()
-        
-        # Load dataset
+
+        # Dataset
         print(f"Loading {split} dataset...")
-        self.setup_dataset()
-        
-        # Contact names for reporting
-        self.contact_names = ['Left Hand', 'Right Hand', 'Left Foot', 'Right Foot']
-    
-    def setup_dataset(self):
-        """Setup dataset using the same split strategy as training.
+        self._setup_dataset()
 
-        Respects self.split ("train" or "val") so that either half can be
-        evaluated independently.
-        """
-        train_videos = self.cfg.DATASET.get('TRAIN_VIDEOS') or None
-        val_videos   = self.cfg.DATASET.get('VAL_VIDEOS')   or None
+    # ------------------------------------------------------------------
 
-        if train_videos and val_videos:
-            # Explicit per-video lists
-            videos = train_videos if self.split == 'train' else val_videos
-            dataset = ETHContactDataset(
-                data_path=self.cfg.DATASET.DATA_PATH,
-                folders=self.cfg.DATASET.TRAIN_FOLDERS,
-                videos=videos,
-                sides=self.cfg.DATASET.SIDES,
-                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
-                rebuild_cache=False
-            )
-        elif self.cfg.DATASET.VAL_FOLDERS and self.split == 'val':
-            # Folder-level split — only applies to val
-            dataset = ETHContactDataset(
-                data_path=self.cfg.DATASET.DATA_PATH,
-                folders=self.cfg.DATASET.VAL_FOLDERS,
-                sides=self.cfg.DATASET.SIDES,
-                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
-                rebuild_cache=False
-            )
-        elif self.cfg.DATASET.VAL_FOLDERS and self.split == 'train':
-            # Folder-level split — train side
-            dataset = ETHContactDataset(
-                data_path=self.cfg.DATASET.DATA_PATH,
-                folders=self.cfg.DATASET.TRAIN_FOLDERS,
-                sides=self.cfg.DATASET.SIDES,
-                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
-                rebuild_cache=False
-            )
+    def _setup_dataset(self):
+        data_root = self.cfg.DATASET.get('DATA_ROOT', None)
+        val_ratio = self.cfg.DATASET.get('VAL_RATIO', 0.2)
+        seed      = self.cfg.DATASET.get('SEED', 42)
+
+        if self.split == 'test':
+            test_npz = self.cfg.DATASET.get('TEST_NPZ', None)
+            if not test_npz:
+                raise ValueError("DATASET.TEST_NPZ not set in config.")
+            dataset = DamonMHRDataset(npz_path=test_npz, data_root=data_root)
         else:
-            # Video-level split — reproduce the same split as training
-            video_split_ratio = self.cfg.DATASET.get('VIDEO_SPLIT_RATIO', 0.8)
-            train_dataset, val_dataset = ETHContactDataset.split_by_videos(
-                val_ratio=1.0 - video_split_ratio,
-                seed=self.cfg.DATASET.SEED,
-                data_path=self.cfg.DATASET.DATA_PATH,
-                folders=self.cfg.DATASET.TRAIN_FOLDERS,
-                sides=self.cfg.DATASET.SIDES,
-                contact_threshold=self.cfg.DATASET.CONTACT_THRESHOLD,
-                rebuild_cache=False
+            # Reproduce the exact same train/val split used during training.
+            train_ds, val_ds = DamonMHRDataset.split_train_val(
+                npz_path=self.cfg.DATASET.TRAINVAL_NPZ,
+                val_ratio=val_ratio,
+                seed=seed,
+                data_root=data_root,
             )
-            dataset = train_dataset if self.split == 'train' else val_dataset
+            dataset = train_ds if self.split == 'train' else val_ds
 
-        print(f"{self.split.capitalize()} samples: {len(dataset)}")
+        print(f"  {self.split.capitalize()} samples: {len(dataset)}")
 
-        self.val_loader = DataLoader(
+        self.loader = DataLoader(
             dataset,
             batch_size=self.cfg.TRAIN.VAL_BATCH_SIZE,
             shuffle=False,
             num_workers=self.cfg.TRAIN.NUM_WORKERS,
-            pin_memory=True
+            pin_memory=False,
+            collate_fn=damon_collate,
         )
-    
-    def prepare_batch_for_model(self, images, bboxes):
-        """Prepare batch for model"""
-        cam_params = {
-            'fx': self.cfg.CAMERA.fx,
-            'fy': self.cfg.CAMERA.fy,
-            'cx': self.cfg.CAMERA.cx,
-            'cy': self.cfg.CAMERA.cy
-        }
-        
-        images_list = [images[i] for i in range(len(images))]
-        bboxes_list = [bboxes[i] for i in range(len(bboxes))]
-        
-        return prepare_training_batch(
-            images_list,
-            bboxes_list,
-            cam_params,
-            target_size=(896, 896),  # Maximum resolution with DINOv3
-            device=self.device
+
+    # ------------------------------------------------------------------
+
+    def _prepare_batch(self, images, bboxes, cam_ks):
+        return prepare_damon_batch(
+            images, bboxes, cam_ks,
+            target_size=tuple(self.cfg.MODEL.IMAGE_SIZE),
+            device=self.device,
         )
-    
+
+    # ------------------------------------------------------------------
+
     @torch.no_grad()
-    def evaluate(self, threshold=0.5):
-        """Evaluate model on validation set"""
-        all_predictions = []
-        all_ground_truth = []
-        all_probabilities = []
-        
-        print("\nRunning evaluation...")
-        for (images, bboxes), contacts in tqdm(self.val_loader):
-            # Prepare batch
-            batch = self.prepare_batch_for_model(images, bboxes)
-            
-            # Forward pass
+    def evaluate(self, threshold: float = 0.5):
+        all_probs = []   # [N, V]
+        all_gt = []      # [N, V]
+
+        for images, bboxes, cam_ks, contact_labels in tqdm(self.loader, desc="Evaluating"):
+            batch = self._prepare_batch(images, bboxes, cam_ks)
             self.model._initialize_batch(batch)
             output = self.model.forward_step(batch, decoder_type="body")
-            contact_logits = output["contact"]["contact_logits"]
-            contact_probs = torch.sigmoid(contact_logits)
-            
-            # Store predictions and ground truth
-            all_predictions.append((contact_probs > threshold).cpu().numpy())
-            all_ground_truth.append(contacts.cpu().numpy())
-            all_probabilities.append(contact_probs.cpu().numpy())
-        
-        # Concatenate all batches
-        predictions = np.concatenate(all_predictions, axis=0)  # (N, 4)
-        ground_truth = np.concatenate(all_ground_truth, axis=0)  # (N, 4)
-        probabilities = np.concatenate(all_probabilities, axis=0)  # (N, 4)
-        
-        # Compute metrics
-        self.print_metrics(predictions, ground_truth, probabilities)
-        
-        # Plot confusion matrices
-        self.plot_confusion_matrices(predictions, ground_truth)
-        
-        # Plot probability distributions
-        self.plot_probability_distributions(probabilities, ground_truth)
-        
-        # Plot ROC curves and compute AUC
-        self.plot_roc_curves(probabilities, ground_truth)
-        
-        return predictions, ground_truth, probabilities
-    
-    def print_metrics(self, predictions, ground_truth, probabilities):
-        """Print evaluation metrics"""
-        print("\n" + "="*80)
-        print("EVALUATION RESULTS")
-        print("="*80)
-        
-        # Overall metrics
-        overall_acc = (predictions == ground_truth).mean()
-        print(f"\nOverall Accuracy: {overall_acc:.4f}")
-        
-        # Per-contact metrics
-        print("\nPer-Contact Metrics:")
-        print("-" * 80)
-        print(f"{'Contact':<15} {'Accuracy':<10} {'Precision':<10} {'Recall':<10} {'F1':<10}")
-        print("-" * 80)
-        
-        for i, name in enumerate(self.contact_names):
-            pred = predictions[:, i]
-            gt = ground_truth[:, i]
-            
-            # Accuracy
-            acc = (pred == gt).mean()
-            
-            # Precision, Recall, F1
-            tp = ((pred == 1) & (gt == 1)).sum()
-            fp = ((pred == 1) & (gt == 0)).sum()
-            fn = ((pred == 0) & (gt == 1)).sum()
-            
-            precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-            recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-            f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-            
-            print(f"{name:<15} {acc:<10.4f} {precision:<10.4f} {recall:<10.4f} {f1:<10.4f}")
-        
-        print("-" * 80)
-        
-        # Contact frequency
-        print("\nContact Frequency (% of samples with contact):")
-        for i, name in enumerate(self.contact_names):
-            gt_freq = ground_truth[:, i].mean()
-            pred_freq = predictions[:, i].mean()
-            print(f"  {name:<15} GT: {gt_freq:.2%}  Pred: {pred_freq:.2%}")
-    
-    def plot_confusion_matrices(self, predictions, ground_truth):
-        """Plot confusion matrix for each contact"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes = axes.flatten()
-        
-        for i, (name, ax) in enumerate(zip(self.contact_names, axes)):
-            # Compute confusion matrix
-            pred = predictions[:, i]
-            gt = ground_truth[:, i]
-            
-            cm = np.zeros((2, 2), dtype=int)
-            cm[0, 0] = ((pred == 0) & (gt == 0)).sum()  # TN
-            cm[0, 1] = ((pred == 1) & (gt == 0)).sum()  # FP
-            cm[1, 0] = ((pred == 0) & (gt == 1)).sum()  # FN
-            cm[1, 1] = ((pred == 1) & (gt == 1)).sum()  # TP
-            
-            # Plot
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax,
-                       xticklabels=['No Contact', 'Contact'],
-                       yticklabels=['No Contact', 'Contact'])
-            ax.set_title(f'{name}\nAccuracy: {(pred == gt).mean():.2%}')
-            ax.set_ylabel('True')
-            ax.set_xlabel('Predicted')
-        
-        plt.tight_layout()
-        out_path = self.figures_dir / f"{self.split}_confusion_matrices.png"
-        plt.savefig(out_path, dpi=150, bbox_inches='tight')
-        print(f"\nSaved confusion matrices to {out_path}")
-        plt.close()
-    
-    def plot_probability_distributions(self, probabilities, ground_truth):
-        """Plot probability distributions for positive and negative samples"""
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        axes = axes.flatten()
-        
-        for i, (name, ax) in enumerate(zip(self.contact_names, axes)):
-            probs = probabilities[:, i]
-            gt = ground_truth[:, i]
-            
-            # Plot histograms
-            ax.hist(probs[gt == 0], bins=50, alpha=0.5, label='No Contact', color='blue')
-            ax.hist(probs[gt == 1], bins=50, alpha=0.5, label='Contact', color='red')
-            
-            # Add threshold line
-            ax.axvline(0.5, color='black', linestyle='--', label='Threshold')
-            
-            ax.set_title(name)
-            ax.set_xlabel('Predicted Probability')
-            ax.set_ylabel('Count')
-            ax.legend()
-            ax.grid(True, alpha=0.3)
-        
-        plt.tight_layout()
-        out_path = self.figures_dir / f"{self.split}_probability_distributions.png"
-        plt.savefig(out_path, dpi=150, bbox_inches='tight')
-        print(f"Saved probability distributions to {out_path}")
-        plt.close()
-    
-    def plot_roc_curves(self, probabilities, ground_truth):
-        """Plot ROC curves and compute AUC for each contact"""
-        fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-        axes = axes.flatten()
-        
-        auc_scores = []
-        
-        # Plot individual ROC curves
-        for i, (name, ax) in enumerate(zip(self.contact_names, axes[:4])):
-            probs = probabilities[:, i]
-            gt = ground_truth[:, i]
-            
-            # Compute ROC curve
-            fpr, tpr, thresholds = roc_curve(gt, probs)
-            roc_auc = auc(fpr, tpr)
-            auc_scores.append(roc_auc)
-            
-            # Plot ROC curve
-            ax.plot(fpr, tpr, color='darkorange', lw=2, 
-                   label=f'ROC curve (AUC = {roc_auc:.3f})')
-            ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
-                   label='Random classifier')
-            
-            ax.set_xlim([0.0, 1.0])
-            ax.set_ylim([0.0, 1.05])
-            ax.set_xlabel('False Positive Rate')
-            ax.set_ylabel('True Positive Rate')
-            ax.set_title(f'{name}\nROC Curve')
-            ax.legend(loc="lower right")
-            ax.grid(True, alpha=0.3)
-        
-        # Plot all ROC curves together
-        ax_all = axes[4]
-        colors = ['red', 'blue', 'green', 'orange']
-        for i, (name, color) in enumerate(zip(self.contact_names, colors)):
-            probs = probabilities[:, i]
-            gt = ground_truth[:, i]
-            
-            fpr, tpr, _ = roc_curve(gt, probs)
-            roc_auc = auc(fpr, tpr)
-            
-            ax_all.plot(fpr, tpr, color=color, lw=2, 
-                       label=f'{name} (AUC = {roc_auc:.3f})')
-        
-        ax_all.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--', 
-                   label='Random')
-        ax_all.set_xlim([0.0, 1.0])
-        ax_all.set_ylim([0.0, 1.05])
-        ax_all.set_xlabel('False Positive Rate')
-        ax_all.set_ylabel('True Positive Rate')
-        ax_all.set_title('All Contacts - ROC Curves')
-        ax_all.legend(loc="lower right")
-        ax_all.grid(True, alpha=0.3)
-        
-        # Summary table
-        ax_summary = axes[5]
-        ax_summary.axis('off')
-        
-        summary_text = "AUC Scores Summary\n" + "="*30 + "\n\n"
-        for i, name in enumerate(self.contact_names):
-            summary_text += f"{name:>12}: {auc_scores[i]:.4f}\n"
-        summary_text += "-"*30 + "\n"
-        summary_text += f"{'Mean AUC':>12}: {np.mean(auc_scores):.4f}\n"
-        
-        ax_summary.text(0.1, 0.5, summary_text,
-                       fontsize=14,
-                       family='monospace',
-                       verticalalignment='center',
-                       bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
-        plt.tight_layout()
-        out_path = self.figures_dir / f"{self.split}_roc_curves.png"
-        plt.savefig(out_path, dpi=150, bbox_inches='tight')
-        print(f"\nSaved ROC curves to {out_path}")
-        
-        # Print AUC summary
-        print("\n" + "="*80)
-        print("AUC SCORES")
-        print("="*80)
-        for i, name in enumerate(self.contact_names):
-            print(f"{name:>15}: {auc_scores[i]:.4f}")
-        print("-"*80)
-        print(f"{'Mean AUC':>15}: {np.mean(auc_scores):.4f}")
-        print("="*80)
-        
-        plt.close()
-        
-        return auc_scores
+            logits = output["contact"]["contact_logits"]
+            probs = torch.sigmoid(logits).cpu().float()
 
+            all_probs.append(probs.numpy())
+            all_gt.append(contact_labels.numpy())
+
+        all_probs = np.concatenate(all_probs, axis=0)   # [N, V]
+        all_gt = np.concatenate(all_gt, axis=0).astype(bool)  # [N, V]
+        all_preds = all_probs > threshold                # [N, V]
+
+        self._print_metrics(all_preds, all_gt, all_probs)
+        self._plot_iou_histogram(all_preds, all_gt)
+        self._plot_prob_distribution(all_probs, all_gt)
+        self._plot_roc_curve(all_probs, all_gt)
+
+        return all_probs, all_preds, all_gt
+
+    # ------------------------------------------------------------------
+    # Metric reporting
+    # ------------------------------------------------------------------
+
+    def _print_metrics(self, preds, gt, probs):
+        tp = (preds & gt).sum()
+        fp = (preds & ~gt).sum()
+        fn = (~preds & gt).sum()
+        tn = (~preds & ~gt).sum()
+
+        accuracy  = (tp + tn) / (tp + tn + fp + fn + 1e-8)
+        precision = tp / (tp + fp + 1e-8)
+        recall    = tp / (tp + fn + 1e-8)
+        f1        = 2 * precision * recall / (precision + recall + 1e-8)
+        iou       = tp / (tp + fp + fn + 1e-8)
+
+        # Per-sample IoU
+        per_sample_tp = (preds & gt).sum(axis=1)
+        per_sample_fp = (preds & ~gt).sum(axis=1)
+        per_sample_fn = (~preds & gt).sum(axis=1)
+        per_sample_iou = per_sample_tp / (per_sample_tp + per_sample_fp + per_sample_fn + 1e-8)
+
+        print("\n" + "=" * 70)
+        print(f"EVALUATION RESULTS  [{self.split}]")
+        print("=" * 70)
+        print(f"  Accuracy : {accuracy:.4f}")
+        print(f"  Precision: {precision:.4f}")
+        print(f"  Recall   : {recall:.4f}")
+        print(f"  F1       : {f1:.4f}")
+        print(f"  IoU      : {iou:.4f}")
+        print(f"  Mean per-sample IoU: {per_sample_iou.mean():.4f}  "
+              f"(median: {np.median(per_sample_iou):.4f})")
+        print(f"  GT contact rate : {gt.mean():.4f}")
+        print(f"  Pred contact rate: {preds.mean():.4f}")
+        print("=" * 70)
+
+    # ------------------------------------------------------------------
+    # Plots
+    # ------------------------------------------------------------------
+
+    def _plot_iou_histogram(self, preds, gt):
+        tp = (preds & gt).sum(axis=1).astype(float)
+        fp = (preds & ~gt).sum(axis=1).astype(float)
+        fn = (~preds & gt).sum(axis=1).astype(float)
+        iou = tp / (tp + fp + fn + 1e-8)
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(iou, bins=50, color='steelblue', edgecolor='white')
+        ax.axvline(iou.mean(), color='red', linestyle='--', label=f'Mean={iou.mean():.3f}')
+        ax.set_xlabel('Per-sample IoU')
+        ax.set_ylabel('Count')
+        ax.set_title(f'Per-sample IoU distribution [{self.split}]')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out = self.figures_dir / f"{self.split}_iou_histogram.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved IoU histogram: {out}")
+
+    def _plot_prob_distribution(self, probs, gt):
+        flat_probs = probs.ravel()
+        flat_gt = gt.ravel()
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        ax.hist(flat_probs[~flat_gt], bins=100, alpha=0.5, label='No contact', color='royalblue',
+                density=True)
+        ax.hist(flat_probs[flat_gt], bins=100, alpha=0.5, label='Contact', color='crimson',
+                density=True)
+        ax.axvline(0.5, color='black', linestyle='--', label='Threshold=0.5')
+        ax.set_xlabel('Predicted probability')
+        ax.set_ylabel('Density')
+        ax.set_title(f'Probability distribution [{self.split}]')
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out = self.figures_dir / f"{self.split}_prob_distribution.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved probability distribution: {out}")
+
+    def _plot_roc_curve(self, probs, gt):
+        from sklearn.metrics import roc_curve, auc
+
+        flat_probs = probs.ravel()
+        flat_gt = gt.ravel().astype(int)
+
+        fpr, tpr, _ = roc_curve(flat_gt, flat_probs)
+        roc_auc = auc(fpr, tpr)
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.plot(fpr, tpr, color='darkorange', lw=2,
+                label=f'ROC (AUC = {roc_auc:.4f})')
+        ax.plot([0, 1], [0, 1], color='navy', lw=1, linestyle='--')
+        ax.set_xlabel('False Positive Rate')
+        ax.set_ylabel('True Positive Rate')
+        ax.set_title(f'ROC Curve [{self.split}]')
+        ax.legend(loc='lower right')
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        out = self.figures_dir / f"{self.split}_roc_curve.png"
+        plt.savefig(out, dpi=150)
+        plt.close()
+        print(f"Saved ROC curve: {out}  (AUC = {roc_auc:.4f})")
+        return roc_auc
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Evaluate trained contact head")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="train/config.yaml",
-        help="Path to config file"
-    )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to trained checkpoint (e.g., train/output/contact_head_eth/best_model.pth)"
-    )
-    parser.add_argument(
-        "--split",
-        type=str,
-        default="val",
-        choices=["train", "val"],
-        help="Which data split to evaluate on (default: val)"
-    )
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.5,
-        help="Classification threshold for contact probability"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use"
-    )
+    parser = argparse.ArgumentParser(description="Evaluate per-vertex contact head on DAMON")
+    parser.add_argument("--config", type=str, default="train/config.yaml")
+    parser.add_argument("--checkpoint", type=str, required=True,
+                        help="Path to trained checkpoint")
+    parser.add_argument("--split", type=str, default="val",
+                        choices=["train", "val", "test"],
+                        help="Dataset split to evaluate on")
+    parser.add_argument("--threshold", type=float, default=0.5,
+                        help="Binary threshold for contact probability")
+    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
-    
-    # Create evaluator
+
     evaluator = ContactEvaluator(
         args.config, args.checkpoint, split=args.split, device=args.device
     )
-    
-    # Run evaluation
-    predictions, ground_truth, probabilities = evaluator.evaluate(threshold=args.threshold)
-    
-    print("\nEvaluation complete!")
+    evaluator.evaluate(threshold=args.threshold)
+    print("\nEvaluation complete.")
 
 
 if __name__ == "__main__":

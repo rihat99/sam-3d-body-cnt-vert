@@ -26,13 +26,13 @@ def build_head(cfg, head_type="mhr", enable_hand_model=False, default_scale_fact
             default_scale_factor=default_scale_factor,
         )
     elif head_type == "contact":
+        contact_cfg = cfg.MODEL.get("CONTACT_HEAD", dict())
         return ContactHead(
             input_dim=cfg.MODEL.DECODER.DIM,
-            num_contacts=cfg.MODEL.get("CONTACT_HEAD", dict()).get("NUM_CONTACTS", 4),
-            mlp_depth=cfg.MODEL.get("CONTACT_HEAD", dict()).get("MLP_DEPTH", 2),
-            mlp_channel_div_factor=cfg.MODEL.get("CONTACT_HEAD", dict()).get(
-                "MLP_CHANNEL_DIV_FACTOR", 4
-            ),
+            num_contact_tokens=contact_cfg.get("NUM_CONTACTS", 21),
+            num_vertices=contact_cfg.get("NUM_VERTICES", 18439),
+            mlp_depth=contact_cfg.get("MLP_DEPTH", 2),
+            mlp_channel_div_factor=contact_cfg.get("MLP_CHANNEL_DIV_FACTOR", 4),
         )
     else:
         raise ValueError("Invalid head type: ", head_type)

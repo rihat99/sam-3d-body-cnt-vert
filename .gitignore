@@ -120,7 +120,6 @@ debug/
 sandbox*
 *.sh
 
-dataset
 images
 output
 *inference_samples

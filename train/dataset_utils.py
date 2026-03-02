@@ -4,6 +4,11 @@ Dataset utilities for preparing batches for SAM-3D-Body training.
 Uses the same transform pipeline as the reference inference code
 (GetBBoxCenterScale -> TopdownAffine -> ToTensor) to ensure batch format
 is identical to what the model expects.
+
+Two entry points:
+  - prepare_training_batch:  original ETH-style (shared camera, N persons in 1 image).
+  - prepare_damon_batch:     DAMON-style (B independent samples, each with its own
+                              camera K; produces [B, 1, ...] shaped tensors).
 """
 
 import numpy as np
@@ -31,102 +36,146 @@ _body_transform = Compose(
 )
 
 
+def _make_transform(target_size=(896, 896)):
+    if target_size == (896, 896):
+        return _body_transform
+    return Compose(
+        [
+            GetBBoxCenterScale(),
+            TopdownAffine(input_size=target_size, use_udp=False),
+            VisionTransformWrapper(ToTensor()),
+        ]
+    )
+
+
+def _process_one(img, bbox, transform):
+    """Run SAM-3D-Body transforms for a single (image, bbox) pair."""
+    if isinstance(img, torch.Tensor):
+        img = img.numpy()
+    if isinstance(bbox, torch.Tensor):
+        bbox = bbox.numpy()
+
+    height, width = img.shape[:2]
+    data_info = dict(img=img)
+    data_info["bbox"] = bbox.astype(np.float32)
+    data_info["bbox_format"] = "xyxy"
+    data_info["mask"] = np.zeros((height, width, 1), dtype=np.uint8)
+    data_info["mask_score"] = np.array(0.0, dtype=np.float32)
+    return transform(data_info)
+
+
+# ---------------------------------------------------------------------------
+# Original helper (ETH-style: N persons from 1 image, shared camera)
+# ---------------------------------------------------------------------------
+
 def prepare_training_batch(images, bboxes, cam_params, target_size=(896, 896), device='cuda'):
     """
-    Prepare a batch for SAM-3D-Body model, using the same transform pipeline
-    as the reference inference code.
+    Prepare a batch for SAM-3D-Body model (ETH-style).
 
-    This ensures that bbox_center, bbox_scale, affine_trans, and the cropped
-    images are computed identically to how the model was trained/evaluated.
+    Creates a batch with shape [1, N, ...] where N is the number of persons
+    (all from the same image / same camera).
 
     Args:
-        images: list of numpy arrays (H, W, 3) in RGB, uint8
-        bboxes: list of numpy arrays (4,) - [x1, y1, x2, y2]
-        cam_params: dict with fx, fy, cx, cy
-        target_size: tuple (H, W) - target image size (must match model config)
-        device: torch device
+        images: list of N numpy arrays (H, W, 3) RGB uint8
+        bboxes: list of N numpy arrays (4,) [x1, y1, x2, y2]
+        cam_params: dict with keys fx, fy, cx, cy
+        target_size: (H, W) must match model config
+        device: torch device string
 
     Returns:
-        batch: dict with all required keys for SAM-3D-Body
+        batch dict with all keys required by SAM-3D-Body
     """
-    # Build transform if target_size differs from default (896, 896)
-    if target_size != (896, 896):
-        transform = Compose(
-            [
-                GetBBoxCenterScale(),
-                TopdownAffine(input_size=target_size, use_udp=False),
-                VisionTransformWrapper(ToTensor()),
-            ]
-        )
-    else:
-        transform = _body_transform
-
-    # Keep the first original image for img_ori (needed for hand processing)
+    transform = _make_transform(target_size)
     orig_img = images[0] if isinstance(images[0], np.ndarray) else images[0].numpy()
 
-    # Process each person using the same pipeline as prepare_batch
-    data_list = []
-    for img, bbox in zip(images, bboxes):
-        if isinstance(img, torch.Tensor):
-            img = img.numpy()
-        if isinstance(bbox, torch.Tensor):
-            bbox = bbox.numpy()
-
-        height, width = img.shape[:2]
-
-        data_info = dict(img=img)
-        data_info["bbox"] = bbox.astype(np.float32)
-        data_info["bbox_format"] = "xyxy"
-
-        # No mask for training (same as reference when masks=None)
-        data_info["mask"] = np.zeros((height, width, 1), dtype=np.uint8)
-        data_info["mask_score"] = np.array(0.0, dtype=np.float32)
-
-        data_list.append(transform(data_info))
-
-    # Collate into batch
+    data_list = [_process_one(img, bbox, transform) for img, bbox in zip(images, bboxes)]
     batch = default_collate(data_list)
-
     max_num_person = batch["img"].shape[0]
 
-    # Add batch dimension (1, N, ...) and convert to float, matching reference
-    for key in [
-        "img",
-        "img_size",
-        "ori_img_size",
-        "bbox_center",
-        "bbox_scale",
-        "bbox",
-        "affine_trans",
-        "mask",
-        "mask_score",
-    ]:
+    for key in ["img", "img_size", "ori_img_size", "bbox_center", "bbox_scale",
+                "bbox", "affine_trans", "mask", "mask_score"]:
         if key in batch:
             batch[key] = batch[key].unsqueeze(0).float()
     if "mask" in batch:
         batch["mask"] = batch["mask"].unsqueeze(2)
     batch["person_valid"] = torch.ones((1, max_num_person))
 
-    # Camera intrinsics - use ORIGINAL (unadjusted) intrinsics.
-    # The model's get_ray_condition() inverts affine_trans to map crop pixels
-    # back to full-image space before applying cam_int, so cam_int must be
-    # the raw camera parameters in full-image space.
     cam_int = torch.tensor(
-        [
-            [
-                [cam_params['fx'], 0, cam_params['cx']],
-                [0, cam_params['fy'], cam_params['cy']],
-                [0, 0, 1],
-            ]
-        ],
+        [[[cam_params['fx'], 0, cam_params['cx']],
+          [0, cam_params['fy'], cam_params['cy']],
+          [0, 0, 1]]],
         dtype=torch.float32,
     )
     batch["cam_int"] = cam_int
-
-    # Store original image (needed for hand crop processing)
     batch["img_ori"] = [NoCollate(orig_img)]
 
-    # Move everything to device
+    for key in batch:
+        if isinstance(batch[key], torch.Tensor):
+            batch[key] = batch[key].to(device)
+
+    return batch
+
+
+# ---------------------------------------------------------------------------
+# DAMON-style helper: B independent samples, each with its own camera K
+# ---------------------------------------------------------------------------
+
+def prepare_damon_batch(images, bboxes, cam_ks, target_size=(896, 896), device='cuda'):
+    """
+    Prepare a batch for SAM-3D-Body from DAMON dataset samples.
+
+    Each sample is one person with its own camera intrinsics K.
+    Produces tensors with shape [B, 1, ...] and cam_int [B, 3, 3].
+
+    Args:
+        images: list/tensor of B numpy arrays (H_i, W_i, 3) RGB uint8
+        bboxes: list/tensor of B arrays/tensors (4,)  [x1, y1, x2, y2]
+        cam_ks: list/tensor of B arrays/tensors (3, 3)  camera intrinsics
+        target_size: (H, W) — must match model IMAGE_SIZE config
+        device: torch device string
+
+    Returns:
+        batch dict with all keys required by SAM-3D-Body, plus cam_int [B, 3, 3]
+    """
+    transform = _make_transform(target_size)
+    B = len(images)
+
+    per_sample = []
+    for img, bbox in zip(images, bboxes):
+        per_sample.append(_process_one(img, bbox, transform))
+
+    # Stack each key into [B, ...] then unsqueeze person dim -> [B, 1, ...]
+    keys_to_stack = ["img", "img_size", "ori_img_size", "bbox_center", "bbox_scale",
+                     "bbox", "affine_trans", "mask", "mask_score"]
+
+    batch = {}
+    for key in keys_to_stack:
+        if key in per_sample[0]:
+            tensors = [
+                s[key] if isinstance(s[key], torch.Tensor) else torch.as_tensor(s[key])
+                for s in per_sample
+            ]
+            stacked = torch.stack(tensors, dim=0).float()  # [B, ...]
+            batch[key] = stacked.unsqueeze(1)  # [B, 1, ...]
+
+    if "mask" in batch:
+        batch["mask"] = batch["mask"].unsqueeze(2)  # [B, 1, 1, H, W]  (binary mask channel)
+
+    batch["person_valid"] = torch.ones((B, 1))
+
+    # Per-sample camera intrinsics: stack into [B, 3, 3]
+    cam_int_list = []
+    for ck in cam_ks:
+        if isinstance(ck, torch.Tensor):
+            cam_int_list.append(ck.float())
+        else:
+            cam_int_list.append(torch.tensor(ck, dtype=torch.float32))
+    batch["cam_int"] = torch.stack(cam_int_list, dim=0)  # [B, 3, 3]
+
+    # img_ori: store original first image for potential hand processing
+    orig_img = images[0] if isinstance(images[0], np.ndarray) else np.array(images[0])
+    batch["img_ori"] = [NoCollate(orig_img)]
+
     for key in batch:
         if isinstance(batch[key], torch.Tensor):
             batch[key] = batch[key].to(device)

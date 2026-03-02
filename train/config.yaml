@@ -13,7 +13,7 @@ MODEL:
   - 0.224
   - 0.225
   BACKBONE:
-    TYPE: dinov3_vith16plus  # DINOv3 ViT-H/16+ for maximum detail at high resolution
+    TYPE: dinov3_vith16plus
     FROZEN: true
     DROP_PATH_RATE: 0.1
   DECODER:
@@ -25,7 +25,10 @@ MODEL:
     CONDITION_TYPE: cliff
     USE_INTRIN_CENTER: false
   CONTACT_HEAD:
-    NUM_CONTACTS: 4
+    # 21 tokens — one per the first 21 MHR70 keypoints (body + toes/heels)
+    NUM_CONTACTS: 21
+    # 18439 MHR mesh vertices
+    NUM_VERTICES: 18439
     MLP_DEPTH: 2
     MLP_CHANNEL_DIV_FACTOR: 4
   PROMPT_ENCODER:
@@ -45,61 +48,39 @@ MODEL:
     MLP_CHANNEL_DIV_FACTOR: 1
     DEFAULT_SCALE_FACTOR: 1.0
 TRAIN:
-  BATCH_SIZE: 64  # Small batch for very high resolution (896x896)
-  VAL_BATCH_SIZE: 64
-  NUM_WORKERS: 8
+  BATCH_SIZE: 32
+  VAL_BATCH_SIZE: 32
+  NUM_WORKERS: 16
   EPOCHS: 20
   LR: 1e-4
   WEIGHT_DECAY: 1e-4
   LR_SCHEDULER: cosine
-  LR_WARMUP_EPOCHS: 0
+  LR_WARMUP_EPOCHS: 1
   LR_MIN: 1e-6
-  USE_FP16: false  # Disabled: MHR model's sparse operations don't support mixed precision
+  USE_FP16: false
   FP16_TYPE: float32
   GRAD_CLIP: 1.0
-  LOSS_WEIGHTS:
-    hand: 1.0
-    foot: 1.0
+  # Positive class weight for heavily imbalanced per-vertex labels.
+  # Set to null to auto-compute from train set statistics.
   POS_WEIGHT: null
   SAVE_FREQ: 5
   VAL_FREQ: 1
   RESUME: null
 DATASET:
-  DATA_PATH: /data3/rikhat.akizhanov/climbing/climb_forces/data/eth
-  TRAIN_FOLDERS:
-  - '1'
-  - '2'
-  # Video-level split (default, recommended): videos are split so train and val
-  # use entirely different recordings. Set VIDEO_SPLIT_RATIO to control the
-  # fraction of videos used for training.
-  VIDEO_SPLIT_RATIO: 0.8
-  # Explicit per-video overrides — if both lists are non-empty they take
-  # priority over VIDEO_SPLIT_RATIO.
-  TRAIN_VIDEOS: ['03_peter_laddering', '06_gianna_laddering', '06_laddering2', '03_laddering1', '08_gianna_climbing', '11_peter_climbing', '10_laddering3', '05_laddering1', '07_laddering2', '09_peter_climbing', '04_laddering1', '10_gianna_climbing', '05_peter_laddering']
-  VAL_VIDEOS: ['07_peter_climbing', '04_gianna_laddering']
-  # Folder-level split — only used when VAL_FOLDERS is non-empty and
-  # TRAIN_VIDEOS / VAL_VIDEOS are both empty.
-  VAL_FOLDERS: []
-  SIDES:
-  - left
-  - right
-  CONTACT_THRESHOLD: 50
+  # Combined train+val npz — split by index with VAL_RATIO / SEED.
+  TRAINVAL_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz
+  # Held-out test set (separate npz file).
+  TEST_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_test_mhr.npz
+  # Root directory containing the 'datasets/' folder referenced in imgname.
+  # Leave null to use DAMON_DATA_ROOT env var or auto-detect from npz_path.
+  DATA_ROOT: /data3/rikhat.akizhanov/DECO
+  # Fraction of TRAINVAL samples held out for validation.
+  VAL_RATIO: 0.2
+  # Fixed random seed — ensures identical train/val split across all runs.
   SEED: 42
-  USE_CACHE: true
-  REBUILD_CACHE: true
 OUTPUT:
+  # Base output directory — each run gets a sub-folder named by date-time
   DIR: ./train/output
-  EXP_NAME: contact_head_eth
+  EXP_NAME: contact_vert  # prefix; actual folder = EXP_NAME_YYYYMMDD_HHMMSS
   LOG_FREQ: 10
   USE_TENSORBOARD: true
-CAMERA:
-  fx: 1419.27383
-  fy: 1419.21058
-  cx: 966.397807
-  cy: 498.565941
-  dist:
-  - 0.03452283
-  - -0.18056709
-  - -0.00329048
-  - -0.00233279
-  - 0.13364379

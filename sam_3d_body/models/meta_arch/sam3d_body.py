@@ -207,13 +207,16 @@ class SAM3DBody(BaseModel):
             # Contact prediction head
             self.head_contact = build_head(self.cfg, "contact")
 
-            # --- Contact token update layers (Idea 3: PE + feature sampling) ---
-            # MHR70 keypoint indices corresponding to each contact token:
-            #   Contact 0 (Left foot)  -> left-ankle  = MHR70 index 13
-            #   Contact 1 (Right foot) -> right-ankle = MHR70 index 14
-            #   Contact 2 (Left hand)  -> left-wrist  = MHR70 index 62
-            #   Contact 3 (Right hand) -> right-wrist = MHR70 index 41
-            self.contact_keypoint_indices = [13, 14, 62, 41]
+            # --- Contact token update layers (PE + feature sampling) ---
+            # Each of the 21 contact tokens corresponds to one of the first 21
+            # MHR70 keypoints (body joints + toes/heels):
+            #   0-nose, 1-left-eye, 2-right-eye, 3-left-ear, 4-right-ear,
+            #   5-left-shoulder, 6-right-shoulder, 7-left-elbow, 8-right-elbow,
+            #   9-left-hip, 10-right-hip, 11-left-knee, 12-right-knee,
+            #   13-left-ankle, 14-right-ankle, 15-left-big-toe-tip,
+            #   16-left-small-toe-tip, 17-left-heel, 18-right-big-toe-tip,
+            #   19-right-small-toe-tip, 20-right-heel
+            self.contact_keypoint_indices = list(range(self.num_contact_tokens))
 
             # Positional encoding: project 2D keypoint position -> decoder dim
             self.contact_posemb_linear = FFN(
@@ -594,8 +597,8 @@ class SAM3DBody(BaseModel):
             ]
             contact_logits = self.head_contact(contact_tokens)
             contact_output = {
-                "contact_logits": contact_logits,  # [B, 4] - logits for each contact
-                "contact_probs": torch.sigmoid(contact_logits),  # [B, 4] - probabilities
+                "contact_logits": contact_logits,  # [B, num_vertices]
+                "contact_probs": torch.sigmoid(contact_logits),  # [B, num_vertices]
             }
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -885,8 +888,8 @@ class SAM3DBody(BaseModel):
             ]
             contact_logits = self.head_contact(contact_tokens)
             contact_output = {
-                "contact_logits": contact_logits,  # [B, 4] - logits for each contact
-                "contact_probs": torch.sigmoid(contact_logits),  # [B, 4] - probabilities
+                "contact_logits": contact_logits,  # [B, num_vertices]
+                "contact_probs": torch.sigmoid(contact_logits),  # [B, num_vertices]
             }
 
         if self.cfg.MODEL.DECODER.get("DO_HAND_DETECT_TOKENS", False):
@@ -2060,22 +2063,19 @@ class SAM3DBody(BaseModel):
 
         Mirrors the keypoint token update mechanism:
         1. Updates positional encoding (token_augment) with predicted 2D positions
-           of the corresponding body part (wrist/ankle).
+           of the corresponding MHR70 keypoint.
         2. Samples image features at those 2D positions via grid_sample and adds
            them to the contact token embeddings.
 
-        Contact token ordering (from contact_head.py):
-            0: Left foot   -> left-ankle   (MHR70 idx 13)
-            1: Right foot  -> right-ankle  (MHR70 idx 14)
-            2: Left hand   -> left-wrist   (MHR70 idx 62)
-            3: Right hand  -> right-wrist  (MHR70 idx 41)
+        Each of the 21 contact tokens corresponds to MHR70 keypoint index i
+        (first 21: nose through right-heel, covering body+toes/heels).
         """
         # Skip after the last layer (same pattern as keypoint_token_update_fn)
         if layer_idx == len(decoder_layers) - 1:
             return token_embeddings, token_augment, pose_output, layer_idx
 
         num_ct = self.num_contact_tokens
-        kp_indices = self.contact_keypoint_indices  # [13, 14, 62, 41]
+        kp_indices = self.contact_keypoint_indices  # list(range(num_contact_tokens))
 
         # Get predicted 2D keypoint positions in crop space (-0.5 to 0.5)
         pred_kps_2d = pose_output["pred_keypoints_2d_cropped"].clone()  # [B, 70, 2]

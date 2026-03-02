@@ -1,233 +1,437 @@
 """
-Demo script showing how to use a trained contact head for inference
+Inference demo for per-vertex Contact Head on DAMON dataset.
 
-This script shows how to:
-1. Load a model with trained contact head
-2. Run inference on ETH dataset samples
-3. Visualize contact predictions
+For each sampled image, generates a figure with:
+  Row 1 — Image + 2D projected mesh:
+      Left:  plain image with bbox
+      Mid:   ground-truth contact vertices highlighted in red
+      Right: predicted contact vertices highlighted in red
+  Row 2 — T-pose 3D mesh (front + back view, same shape/scale as prediction):
+      GT contact coloring: front and back
+      Pred contact coloring: front and back
+
+Usage:
+    CUDA_VISIBLE_DEVICES=3 python train/inference_demo.py \\
+        --config train/config.yaml \\
+        --checkpoint train/output/contact_vert_20260222_123456/best_model.pth \\
+        --num_samples 20 \\
+        --split val
 """
 
 import os
 import sys
-from pathlib import Path
-import torch
-import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-from matplotlib.patches import Rectangle
 import argparse
+import random
+from pathlib import Path
 
-# Add parent directory to path
+import cv2
+import numpy as np
+import torch
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.collections import PolyCollection
+from matplotlib.patches import Rectangle
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
 sys.path.insert(0, str(Path(__file__).parent.parent))
-sys.path.insert(0, str(Path(__file__).parent.parent / "dataset" / "eth"))
-
+sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.utils.config import get_config
-from dataset import ETHContactDataset
-from dataset_utils import prepare_training_batch
+from damon_mhr import DamonMHRDataset
+from dataset_utils import prepare_damon_batch
+from train_contact import damon_collate
 
 
-def visualize_contact_prediction(image, bbox, contact_gt, contact_pred, contact_probs, save_path=None):
+# ---------------------------------------------------------------------------
+# Colour palette
+# ---------------------------------------------------------------------------
+COLOR_CONTACT   = np.array([0.95, 0.15, 0.15])   # red  — in contact
+COLOR_NO_CONTACT = np.array([0.55, 0.65, 0.80])  # steel-blue — no contact
+COLOR_BBOX      = (1.0, 0.9, 0.0)                 # yellow bbox
+
+
+# ---------------------------------------------------------------------------
+# Mesh helpers
+# ---------------------------------------------------------------------------
+
+def _compute_face_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray:
+    """Unit outward face normals. Returns [F, 3]."""
+    v0 = vertices[faces[:, 0]]
+    v1 = vertices[faces[:, 1]]
+    v2 = vertices[faces[:, 2]]
+    n = np.cross(v1 - v0, v2 - v0)
+    n /= np.linalg.norm(n, axis=1, keepdims=True).clip(1e-8)
+    return n
+
+
+def _face_colors(contact_mask: np.ndarray, faces: np.ndarray,
+                 normals: np.ndarray) -> np.ndarray:
     """
-    Visualize contact predictions on image
-    
-    Args:
-        image: RGB image (H, W, 3)
-        bbox: Bounding box [x1, y1, x2, y2]
-        contact_gt: Ground truth contacts [left_hand, right_hand, left_foot, right_foot]
-        contact_pred: Predicted contacts [left_hand, right_hand, left_foot, right_foot]
-        contact_probs: Contact probabilities [left_hand, right_hand, left_foot, right_foot]
-        save_path: Path to save visualization
+    Per-face RGBA with two-light Lambertian shading, fully opaque.
+
+    Coordinate system: X = left–right,  Y = depth,  Z = up
+    Key light: front-right-above  [0.5, -1.0, 0.8]
+    Fill light: back-left         [-0.4,  1.0, 0.3]  (40% strength)
     """
-    fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-    
-    # Display image
+    key  = np.array([ 0.5, -1.0,  0.8]); key  /= np.linalg.norm(key)
+    fill = np.array([-0.4,  1.0,  0.3]); fill /= np.linalg.norm(fill)
+
+    face_hit = contact_mask[faces].any(axis=1)          # [F]
+
+    ambient  = 0.40
+    i_key    = np.clip(normals @ key,  0, 1)            # [F]
+    i_fill   = np.clip(normals @ fill, 0, 1) * 0.40    # [F]
+    shading  = np.clip(ambient + i_key + i_fill, 0, 1) # [F]
+
+    base_rgb = np.where(
+        face_hit[:, None],
+        COLOR_CONTACT[None],
+        COLOR_NO_CONTACT[None],
+    )  # [F, 3]
+
+    lit_rgb = np.clip(base_rgb * shading[:, None], 0, 1)
+    return np.concatenate([lit_rgb, np.ones((len(faces), 1))], axis=1)  # [F, 4]
+
+
+def render_mesh_3d(ax, vertices: np.ndarray, faces: np.ndarray,
+                   contact_mask: np.ndarray, title: str = "",
+                   elev: float = 0.0, azim: float = -90.0):
+    """
+    Draw a lit 3-D mesh on *ax* with back-face culling.
+
+    Expects vertices remapped so that:
+      axis 0 (X) = left–right,  axis 1 (Y) = depth,  axis 2 (Z) = up
+    azim=-90 → front view (camera at −Y), azim=90 → back view.
+    """
+    # --- Back-face culling ---
+    # Camera position direction (scene → camera, unit vector)
+    az, el = np.radians(azim), np.radians(elev)
+    cam_dir = np.array([np.cos(el) * np.cos(az),
+                        np.cos(el) * np.sin(az),
+                        np.sin(el)])
+    all_normals = _compute_face_normals(vertices, faces)   # [F, 3]
+    visible     = (all_normals @ cam_dir) > 0              # [F] bool
+    vis_faces   = faces[visible]
+    vis_normals = all_normals[visible]
+
+    fcolors = _face_colors(contact_mask, vis_faces, vis_normals)
+    tris    = vertices[vis_faces]                          # [F', 3, 3]
+
+    coll = Poly3DCollection(tris, zsort="average")
+    coll.set_facecolor(fcolors)
+    coll.set_edgecolor("none")
+    ax.add_collection3d(coll)
+
+    # --- Axis limits ---
+    # Equal span for X (width) and Z (height); proportional Y (depth)
+    xlo, xhi = vertices[:, 0].min(), vertices[:, 0].max()
+    zlo, zhi = vertices[:, 2].min(), vertices[:, 2].max()
+    span = max(xhi - xlo, zhi - zlo) * 0.505
+    xmid, zmid = (xhi + xlo) / 2, (zhi + zlo) / 2
+    ax.set_xlim(xmid - span, xmid + span)
+    ax.set_zlim(zmid - span, zmid + span)
+    ylo, yhi = vertices[:, 1].min(), vertices[:, 1].max()
+    ypad = (yhi - ylo) * 0.05
+    ax.set_ylim(ylo - ypad, yhi + ypad)
+
+    # Shrink the display box so Y (shallow depth) doesn't waste viewport space
+    y_ratio = max((yhi - ylo) / (2 * span), 0.05)
+    ax.set_box_aspect([1, y_ratio, 1])
+
+    ax.view_init(elev=elev, azim=azim)
+    ax.set_title(title, fontsize=9)
+    ax.set_axis_off()
+
+
+def overlay_mesh_on_image_2d(ax, image: np.ndarray,
+                              verts_2d: np.ndarray, verts_3d: np.ndarray,
+                              faces: np.ndarray, contact_mask: np.ndarray,
+                              title: str = ""):
+    """
+    Render the full projected mesh as solid filled triangles on top of *image*.
+
+    verts_2d:     [V, 2]  pixel (x, y)
+    verts_3d:     [V, 3]  camera-space 3-D coords (used for depth sort + shading)
+    faces:        [F, 3]  triangle indices
+    contact_mask: [V]     bool
+    """
     ax.imshow(image)
-    
-    # Draw bounding box
-    x1, y1, x2, y2 = bbox
-    rect = Rectangle(
-        (x1, y1), x2 - x1, y2 - y1,
-        linewidth=2, edgecolor='yellow', facecolor='none',
-        label='Person BBox'
-    )
-    ax.add_patch(rect)
-    
-    # Contact labels
-    contact_names = ['L Hand', 'R Hand', 'L Foot', 'R Foot']
-    
-    # Create text box with predictions
-    text_lines = ["Contact Predictions:"]
-    text_lines.append("-" * 30)
-    
-    for i, name in enumerate(contact_names):
-        gt = "Yes" if contact_gt[i] else "No"
-        pred = "Yes" if contact_pred[i] else "No"
-        prob = contact_probs[i]
-        
-        # Color code by correctness
-        if contact_gt[i] == contact_pred[i]:
-            color = "✓"
-        else:
-            color = "✗"
-        
-        text_lines.append(f"{color} {name}: GT={gt:3s} Pred={pred:3s} ({prob:.2f})")
-    
-    # Add text box
-    text = "\n".join(text_lines)
-    props = dict(boxstyle='round', facecolor='white', alpha=0.8)
-    ax.text(
-        0.02, 0.98, text,
-        transform=ax.transAxes,
-        fontsize=10,
-        verticalalignment='top',
-        bbox=props,
-        family='monospace'
-    )
-    
-    ax.axis('off')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"Saved visualization to {save_path}")
-    else:
-        plt.show()
-    
-    plt.close()
 
+    # Depth sort: draw farthest faces first (painter's algorithm)
+    face_z    = verts_3d[faces, 2].mean(axis=1)   # [F] avg depth
+    order     = np.argsort(-face_z)                # descending → far first
+    sf        = faces[order]                       # sorted faces
+
+    # Lambertian shading: camera looks along +Z in OpenCV space,
+    # so faces with normal pointing toward −Z face the camera.
+    normals  = _compute_face_normals(verts_3d, sf)          # [F, 3]
+    diffuse  = np.clip(-normals[:, 2], 0, 1)                # [F]
+    shading  = 0.35 + 0.65 * diffuse                        # [F]
+
+    face_hit = contact_mask[sf].any(axis=1)
+    base_rgb = np.where(face_hit[:, None],
+                        COLOR_CONTACT[None], COLOR_NO_CONTACT[None])
+    lit_rgb  = np.clip(base_rgb * shading[:, None], 0, 1)
+    rgba     = np.concatenate([lit_rgb, np.ones((len(sf), 1))], axis=1)
+
+    polys = verts_2d[sf]          # [F, 3, 2]
+    coll  = PolyCollection(polys, facecolors=rgba, edgecolors="none")
+    ax.add_collection(coll)
+
+    ax.set_xlim(0, image.shape[1])
+    ax.set_ylim(image.shape[0], 0)   # flip Y for image coordinates
+    ax.set_title(title, fontsize=9)
+    ax.set_axis_off()
+
+
+# ---------------------------------------------------------------------------
+# Per-sample figure
+# ---------------------------------------------------------------------------
+
+def make_figure(image: np.ndarray,
+                bbox: np.ndarray,
+                verts_2d: np.ndarray,
+                verts_3d_cam: np.ndarray,
+                verts_3d_tpose: np.ndarray,
+                faces: np.ndarray,
+                gt_mask: np.ndarray,
+                pred_mask: np.ndarray,
+                iou: float,
+                sample_idx: int) -> plt.Figure:
+    """
+    Row 0 (3 panels): plain image | GT mesh overlay | Pred mesh overlay
+    Row 1 (4 panels): GT T-pose (front+back)  |gap|  Pred T-pose (front+back)
+    """
+    fig = plt.figure(figsize=(22, 10), dpi=200)
+    fig.suptitle(
+        f"Sample #{sample_idx}  |  IoU={iou:.3f}  "
+        f"GT contacts={gt_mask.sum()}  Pred contacts={pred_mask.sum()}",
+        fontsize=12, y=0.995,
+    )
+
+    # ── Subfigures: top row + bottom row ──────────────────────────────────────
+    sfig_top, sfig_bot = fig.subfigures(2, 1, height_ratios=[1, 1.1], hspace=0.04)
+
+    # ---- Row 0: 3 equal panels -----------------------------------------------
+    gs_top = sfig_top.add_gridspec(1, 3, wspace=0.03,
+                                   left=0.01, right=0.99, top=0.92, bottom=0.06)
+    ax_img  = sfig_top.add_subplot(gs_top[0])
+    ax_gt2d = sfig_top.add_subplot(gs_top[1])
+    ax_pr2d = sfig_top.add_subplot(gs_top[2])
+
+    ax_img.imshow(image)
+    x1, y1, x2, y2 = bbox.astype(int)
+    ax_img.add_patch(Rectangle(
+        (x1, y1), x2 - x1, y2 - y1,
+        linewidth=1.5, edgecolor=COLOR_BBOX, facecolor="none",
+    ))
+    ax_img.set_title("Input image", fontsize=10)
+    ax_img.set_axis_off()
+
+    overlay_mesh_on_image_2d(ax_gt2d, image, verts_2d, verts_3d_cam,
+                              faces, gt_mask, title="GT contact")
+    overlay_mesh_on_image_2d(ax_pr2d, image, verts_2d, verts_3d_cam,
+                              faces, pred_mask, title="Pred contact")
+
+    # ---- Row 1: GT pair (left) | gap | Pred pair (right) ---------------------
+    # Remap T-pose verts: OpenCV (X right, Y down, Z depth) →
+    #   matplotlib (X right, Y depth, Z up)
+    tv = np.stack([ verts_3d_tpose[:, 0],
+                    verts_3d_tpose[:, 2],
+                   -verts_3d_tpose[:, 1]], axis=1)
+
+    sfig_gt, sfig_pr = sfig_bot.subfigures(1, 2, wspace=0.12)
+
+    sfig_gt.suptitle("Ground Truth", fontsize=11, fontweight="bold", y=0.97)
+    sfig_pr.suptitle("Prediction",   fontsize=11, fontweight="bold", y=0.97)
+
+    gs_gt = sfig_gt.add_gridspec(1, 2, wspace=0.01,
+                                  left=0.02, right=0.98, top=0.88, bottom=0.02)
+    gs_pr = sfig_pr.add_gridspec(1, 2, wspace=0.01,
+                                  left=0.02, right=0.98, top=0.88, bottom=0.02)
+
+    ax_gt_front = sfig_gt.add_subplot(gs_gt[0], projection="3d")
+    ax_gt_back  = sfig_gt.add_subplot(gs_gt[1], projection="3d")
+    ax_pr_front = sfig_pr.add_subplot(gs_pr[0], projection="3d")
+    ax_pr_back  = sfig_pr.add_subplot(gs_pr[1], projection="3d")
+
+    render_mesh_3d(ax_gt_front, tv, faces, gt_mask,
+                   title="Front", elev=0, azim=-90)
+    render_mesh_3d(ax_gt_back,  tv, faces, gt_mask,
+                   title="Back",  elev=0, azim=90)
+    render_mesh_3d(ax_pr_front, tv, faces, pred_mask,
+                   title="Front", elev=0, azim=-90)
+    render_mesh_3d(ax_pr_back,  tv, faces, pred_mask,
+                   title="Back",  elev=0, azim=90)
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Contact head inference demo")
-    parser.add_argument(
-        "--config",
-        type=str,
-        default="train/config.yaml",
-        help="Path to config file"
+    parser = argparse.ArgumentParser(
+        description="Inference demo — per-vertex contact prediction on DAMON"
     )
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        required=True,
-        help="Path to trained checkpoint"
-    )
-    parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=10,
-        help="Number of samples to visualize"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default="train/inference_samples",
-        help="Directory to save visualizations"
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="cuda",
-        help="Device to use"
-    )
+    parser.add_argument("--config",      type=str, default="train/config.yaml")
+    parser.add_argument("--checkpoint",  type=str, required=True,
+                        help="Path to trained checkpoint (.pth)")
+    parser.add_argument("--num_samples", type=int, default=10,
+                        help="Number of samples to visualize")
+    parser.add_argument("--split",       type=str, default="val",
+                        choices=["train", "val", "trainval", "test"],
+                        help="Which dataset split to sample from")
+    parser.add_argument("--output_dir",  type=str,
+                        default="train/inference_samples",
+                        help="Directory to save figures")
+    parser.add_argument("--threshold",   type=float, default=0.5,
+                        help="Contact probability threshold")
+    parser.add_argument("--seed",        type=int, default=0,
+                        help="Random seed for sample selection")
+    parser.add_argument("--device",      type=str, default="cuda")
     args = parser.parse_args()
-    
-    # Create output directory
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load config
-    print("Loading config...")
+
+    # ---- Config ----
     cfg = get_config(args.config)
-    
-    # Load base model
+
+    # ---- Model ----
     print("Loading SAM-3D-Body model...")
-    model, model_cfg = load_sam_3d_body(
+    model, _ = load_sam_3d_body(
         checkpoint_path=cfg.MODEL.CHECKPOINT_PATH,
         device=args.device,
-        mhr_path=cfg.MODEL.MHR_MODEL_PATH
+        mhr_path=cfg.MODEL.MHR_MODEL_PATH,
     )
-    
-    # Load trained contact head
-    print(f"Loading trained contact head from {args.checkpoint}")
-    checkpoint = torch.load(args.checkpoint, map_location=args.device)
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-    else:
-        model.load_state_dict(checkpoint, strict=False)
-    
-    model.eval()
-    
-    # Load dataset
-    print("Loading dataset...")
-    dataset = ETHContactDataset(
-        data_path=cfg.DATASET.DATA_PATH,
-        folders=cfg.DATASET.TRAIN_FOLDERS,
-        sides=cfg.DATASET.SIDES,
-        contact_threshold=cfg.DATASET.CONTACT_THRESHOLD,
-        rebuild_cache=False
-    )
-    
-    print(f"\nRunning inference on {args.num_samples} samples...")
-    
-    # Process samples
-    for idx in range(min(args.num_samples, len(dataset))):
-        print(f"\nProcessing sample {idx + 1}/{args.num_samples}")
 
-        sample_id = np.random.randint(0, len(dataset))
-        
-        # Get sample
-        (image, bbox), contact_gt = dataset[sample_id]
-        
-        # Prepare batch
-        cam_params = {
-            'fx': cfg.CAMERA.fx,
-            'fy': cfg.CAMERA.fy,
-            'cx': cfg.CAMERA.cx,
-            'cy': cfg.CAMERA.cy
-        }
-        
-        batch = prepare_training_batch(
-            [image],
-            [bbox],
-            cam_params,
-            target_size=(896, 896),  # Maximum resolution with DINOv3
-            device=args.device
+    print(f"Loading checkpoint: {args.checkpoint}")
+    ckpt = torch.load(args.checkpoint, map_location=args.device)
+    state = ckpt.get("model_state_dict", ckpt)
+    model.load_state_dict(state, strict=False)
+    model.eval()
+
+    # Mesh faces: [F, 3]
+    faces = model.head_pose.faces.cpu().numpy().astype(np.int32)
+
+    # ---- Dataset ----
+    data_root = cfg.DATASET.get("DATA_ROOT", None)
+    val_ratio = cfg.DATASET.get("VAL_RATIO", 0.2)
+    seed_ds   = cfg.DATASET.get("SEED", 42)
+
+    if args.split == "test":
+        dataset = DamonMHRDataset(
+            npz_path=cfg.DATASET.TEST_NPZ, data_root=data_root
         )
-        
-        # Run inference
+    elif args.split == "trainval":
+        dataset = DamonMHRDataset(
+            npz_path=cfg.DATASET.TRAINVAL_NPZ, data_root=data_root
+        )
+    else:
+        train_ds, val_ds = DamonMHRDataset.split_train_val(
+            npz_path=cfg.DATASET.TRAINVAL_NPZ,
+            val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
+        )
+        dataset = train_ds if args.split == "train" else val_ds
+
+    print(f"Dataset split='{args.split}', size={len(dataset)}")
+
+    # Random indices
+    indices = random.sample(range(len(dataset)), min(args.num_samples, len(dataset)))
+
+    # ---- Inference loop ----
+    ious = []
+    for run_idx, ds_idx in enumerate(indices):
+        print(f"\n[{run_idx+1}/{len(indices)}]  dataset index {ds_idx}")
+
+        (image_np, bbox, cam_k), contact_label = dataset[ds_idx]
+
+        # Prepare model batch (single sample)
         with torch.no_grad():
+            batch = prepare_damon_batch(
+                [image_np], [bbox], [cam_k],
+                target_size=tuple(cfg.MODEL.IMAGE_SIZE),
+                device=args.device,
+            )
             model._initialize_batch(batch)
             output = model.forward_step(batch, decoder_type="body")
-            contact_logits = output["contact"]["contact_logits"]
-            contact_probs = torch.sigmoid(contact_logits).cpu().numpy()[0]
-            contact_pred = (contact_probs > 0.5).astype(bool)
-        
-        # Visualize
-        save_path = output_dir / f"sample_{idx:03d}.png"
-        visualize_contact_prediction(
-            image, bbox,
-            contact_gt, contact_pred, contact_probs,
-            save_path=save_path
+
+        # ---- Contact predictions ----
+        contact_logits = output["contact"]["contact_logits"]  # [1, 18439]
+        pred_probs = torch.sigmoid(contact_logits)[0].cpu().numpy()  # [18439]
+        pred_mask = pred_probs > args.threshold                       # [18439] bool
+        gt_mask   = contact_label.numpy().astype(bool)                # [18439] bool
+
+        # ---- 3D T-pose vertices (zero pose, same shape/scale as prediction) ----
+        with torch.no_grad():
+            pred_shape = output["mhr"]["shape"]   # [1, 45]
+            pred_scale = output["mhr"]["scale"]   # [1, 28]
+            pred_face  = output["mhr"]["face"]    # [1, 72]
+            tpose_verts = model.head_pose.mhr_forward(
+                global_trans=torch.zeros(1, 3, device=args.device),
+                global_rot=torch.zeros(1, 3, device=args.device),
+                body_pose_params=torch.zeros(1, 130, device=args.device),
+                hand_pose_params=None,
+                scale_params=pred_scale,
+                shape_params=pred_shape,
+                expr_params=pred_face,
+            )
+        verts_3d_tpose = tpose_verts[0].cpu().numpy()   # [18439, 3]
+        verts_3d_tpose[:, [1, 2]] *= -1                 # camera system correction
+
+        # ---- 3D posed vertices + 2D projection ----
+        # pred_vertices are root-centered; pred_cam_t places them in camera space.
+        # The model's camera_project() already computes the correct pixel projection
+        # and stores it in pred_keypoints_2d_verts — use that directly.
+        verts_3d_posed = output["mhr"]["pred_vertices"][0].cpu().numpy()     # [V, 3]
+        pred_cam_t_np  = output["mhr"]["pred_cam_t"][0].cpu().numpy()        # [3]
+        verts_3d_cam   = verts_3d_posed + pred_cam_t_np                      # [V, 3] camera space
+        verts_2d       = output["mhr"]["pred_keypoints_2d_verts"][0].cpu().numpy()  # [V, 2] pixels
+
+        # ---- IoU ----
+        tp = (pred_mask & gt_mask).sum()
+        fp = (pred_mask & ~gt_mask).sum()
+        fn = (~pred_mask & gt_mask).sum()
+        iou = float(tp) / (tp + fp + fn + 1e-8)
+        ious.append(iou)
+
+        print(f"  GT contacts:   {gt_mask.sum()}")
+        print(f"  Pred contacts: {pred_mask.sum()}")
+        print(f"  IoU:           {iou:.4f}")
+
+        # ---- Figure ----
+        fig = make_figure(
+            image          = image_np,
+            bbox           = bbox.numpy(),
+            verts_2d       = verts_2d,
+            verts_3d_cam   = verts_3d_cam,
+            verts_3d_tpose = verts_3d_tpose,
+            faces          = faces,
+            gt_mask        = gt_mask,
+            pred_mask      = pred_mask,
+            iou            = iou,
+            sample_idx     = ds_idx,
         )
-        
-        # Print results
-        contact_names = ['Left Hand', 'Right Hand', 'Left Foot', 'Right Foot']
-        print("  Contact predictions:")
-        for i, name in enumerate(contact_names):
-            gt = "Yes" if contact_gt[i] else "No "
-            pred = "Yes" if contact_pred[i] else "No "
-            prob = contact_probs[i]
-            match = "✓" if contact_gt[i] == contact_pred[i] else "✗"
-            print(f"    {match} {name:>11}: GT={gt} Pred={pred} (prob={prob:.3f})")
-    
-    print(f"\n✓ Done! Visualizations saved to {output_dir}")
-    
-    # Print summary statistics
-    print("\nSummary:")
-    print(f"  Samples processed: {args.num_samples}")
-    print(f"  Output directory: {output_dir}")
+
+        save_path = output_dir / f"sample_{run_idx:04d}_idx{ds_idx}_iou{iou:.3f}.png"
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  Saved: {save_path}")
+
+    # ---- Summary ----
+    print(f"\n{'='*60}")
+    print(f"Done.  {len(ious)} samples  |  mean IoU = {np.mean(ious):.4f}  "
+          f"(median {np.median(ious):.4f})")
+    print(f"Figures saved to: {output_dir.resolve()}")
 
 
 if __name__ == "__main__":
