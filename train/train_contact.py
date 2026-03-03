@@ -147,8 +147,9 @@ class ContactTrainer:
             collate_fn=damon_collate,
         )
 
-        # ---- Positive class weight ----
+        # ---- Positive class weight & negative class weight ----
         self.pos_weight = self._compute_pos_weight()
+        self.neg_weight = self.cfg.TRAIN.get("NEG_WEIGHT", 1.0)
 
         # ---- Optimizer & scheduler ----
         self.optimizer = torch.optim.AdamW(
@@ -236,17 +237,20 @@ class ContactTrainer:
 
     def _compute_loss(self, logits: torch.Tensor, targets: torch.Tensor):
         """
-        Per-vertex weighted binary cross-entropy.
+        Per-vertex asymmetric binary cross-entropy.
+
+        pos_weight scales the positive class (combats class imbalance / recall).
+        neg_weight scales the negative class (penalises false positives / precision).
 
         Args:
             logits:  [B, num_vertices]
             targets: [B, num_vertices] int64 binary
         """
-        return F.binary_cross_entropy_with_logits(
-            logits,
-            targets.float(),
-            pos_weight=self.pos_weight,
-        )
+        targets_f = targets.float()
+        probs = torch.sigmoid(logits).clamp(min=1e-7, max=1 - 1e-7)
+        pos_loss = -self.pos_weight * targets_f * torch.log(probs)
+        neg_loss = -self.neg_weight * (1 - targets_f) * torch.log(1 - probs)
+        return (pos_loss + neg_loss).mean()
 
     @torch.no_grad()
     def _compute_metrics(self, logits: torch.Tensor, targets: torch.Tensor) -> dict:

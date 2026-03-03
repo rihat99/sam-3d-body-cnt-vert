@@ -27,15 +27,22 @@ MODEL:
   CONTACT_HEAD:
     # 21 tokens — one per the first 21 MHR70 keypoints (body + toes/heels)
     NUM_CONTACTS: 21
+    # Extra global token(s) not updated with image features (0 = off)
+    NUM_GLOBAL_TOKENS: 1
     # 18439 MHR mesh vertices
     NUM_VERTICES: 18439
     MLP_DEPTH: 2
-    MLP_CHANNEL_DIV_FACTOR: 4
+    MLP_CHANNEL_DIV_FACTOR: 1
+    # K×K grid sampling around each keypoint (1 = original single-point)
+    GRID_SIZE: 3
+    GRID_RADIUS: 0.1
   PROMPT_ENCODER:
     ENABLE: true
     MAX_NUM_CLICKS: 1
     PROMPT_KEYPOINTS: mhr70
     MASK_EMBED_TYPE: null
+  # SMPL model for T-pose template vertices and face connectivity (used in inference_demo.py)
+  SMPL_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
   MHR_HEAD:
     MHR_MODEL_PATH: ''
     MLP_DEPTH: 1
@@ -63,6 +70,8 @@ TRAIN:
   # Positive class weight for heavily imbalanced per-vertex labels.
   # Set to null to auto-compute from train set statistics.
   POS_WEIGHT: null
+  # Multiplier on the negative-class BCE loss; >1.0 penalises false positives harder.
+  NEG_WEIGHT: 2.0
   SAVE_FREQ: 5
   VAL_FREQ: 1
   RESUME: null
@@ -71,6 +80,9 @@ DATASET:
   TRAINVAL_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz
   # Held-out test set (separate npz file).
   TEST_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_test_mhr.npz
+  # Original DECO NPZs with SMPL (6890-vertex) contact labels — used for SMPL-space evaluation.
+  SMPL_TRAINVAL_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
+  SMPL_TEST_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz
   # Root directory containing the 'datasets/' folder referenced in imgname.
   # Leave null to use DAMON_DATA_ROOT env var or auto-detect from npz_path.
   DATA_ROOT: /data3/rikhat.akizhanov/DECO

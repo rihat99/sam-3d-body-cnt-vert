@@ -196,13 +196,15 @@ class SAM3DBody(BaseModel):
 
         # Contact prediction head and tokens
         if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
-            self.num_contact_tokens = self.cfg.MODEL.get("CONTACT_HEAD", dict()).get(
-                "NUM_CONTACTS", 4
-            )
+            contact_head_cfg = self.cfg.MODEL.get("CONTACT_HEAD", dict())
+            self.num_contact_tokens = contact_head_cfg.get("NUM_CONTACTS", 4)
+            # Extra global token(s) not updated with image features
+            self.num_global_contact_tokens = contact_head_cfg.get("NUM_GLOBAL_TOKENS", 0)
+            self.total_contact_tokens = self.num_contact_tokens + self.num_global_contact_tokens
             # Learnable query tokens for contact prediction
             # Index 0: Left foot, 1: Right foot, 2: Left hand, 3: Right hand
             self.contact_embedding = nn.Embedding(
-                self.num_contact_tokens, self.cfg.MODEL.DECODER.DIM
+                self.total_contact_tokens, self.cfg.MODEL.DECODER.DIM
             )
             # Contact prediction head
             self.head_contact = build_head(self.cfg, "contact")
@@ -230,6 +232,9 @@ class SAM3DBody(BaseModel):
             self.contact_feat_linear = nn.Linear(
                 self.backbone.embed_dims, self.cfg.MODEL.DECODER.DIM
             )
+            # K×K grid sampling params
+            self.contact_grid_size   = contact_head_cfg.get("GRID_SIZE", 1)
+            self.contact_grid_radius = contact_head_cfg.get("GRID_RADIUS", 0.1)
 
         self.keypoint_posemb_linear = FFN(
             embed_dims=2,
@@ -593,7 +598,7 @@ class SAM3DBody(BaseModel):
         contact_output = None
         if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
             contact_tokens = pose_token[
-                :, contact_emb_start_idx : contact_emb_start_idx + self.num_contact_tokens
+                :, contact_emb_start_idx : contact_emb_start_idx + self.total_contact_tokens
             ]
             contact_logits = self.head_contact(contact_tokens)
             contact_output = {
@@ -884,7 +889,7 @@ class SAM3DBody(BaseModel):
         contact_output = None
         if self.cfg.MODEL.DECODER.get("DO_CONTACT_TOKENS", False):
             contact_tokens = pose_token[
-                :, contact_emb_start_idx_hand : contact_emb_start_idx_hand + self.num_contact_tokens
+                :, contact_emb_start_idx_hand : contact_emb_start_idx_hand + self.total_contact_tokens
             ]
             contact_logits = self.head_contact(contact_tokens)
             contact_output = {
@@ -2113,18 +2118,48 @@ class SAM3DBody(BaseModel):
         ]:
             sample_points[:, :, 0] = sample_points[:, :, 0] / 12 * 16
 
-        # Bilinear sampling: [B, C, H, W] + [B, 4, 1, 2] -> [B, C, 4, 1]
-        sampled_feats = (
-            F.grid_sample(
-                image_embeddings,
-                sample_points[:, :, None, :],  # [B, 4, 1, 2]
-                mode="bilinear",
-                padding_mode="zeros",
-                align_corners=False,
-            )
-            .squeeze(3)
-            .permute(0, 2, 1)
-        )  # [B, 4, C_backbone]
+        # Bilinear sampling with optional K×K neighbourhood grid
+        gs = self.contact_grid_size
+        if gs > 1:
+            half = gs // 2
+            offsets = torch.tensor(
+                [
+                    [dy * self.contact_grid_radius, dx * self.contact_grid_radius]
+                    for dy in range(-half, half + 1)
+                    for dx in range(-half, half + 1)
+                ],
+                dtype=sample_points.dtype,
+                device=sample_points.device,
+            )  # [K*K, 2]
+            # [B, num_ct, K*K, 2]
+            pts = sample_points.unsqueeze(2) + offsets[None, None]
+            B_s, nc, KK, _ = pts.shape
+            pts_flat = pts.reshape(B_s, nc * KK, 1, 2)
+            feats_flat = (
+                F.grid_sample(
+                    image_embeddings,
+                    pts_flat,
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+                .squeeze(3)
+                .permute(0, 2, 1)
+            )  # [B, nc*KK, C_backbone]
+            sampled_feats = feats_flat.reshape(B_s, nc, KK, -1).mean(dim=2)  # [B, nc, C_backbone]
+        else:
+            # Original single-point sampling
+            sampled_feats = (
+                F.grid_sample(
+                    image_embeddings,
+                    sample_points[:, :, None, :],  # [B, num_ct, 1, 2]
+                    mode="bilinear",
+                    padding_mode="zeros",
+                    align_corners=False,
+                )
+                .squeeze(3)
+                .permute(0, 2, 1)
+            )  # [B, num_ct, C_backbone]
 
         # Zero out features for invalid locations
         sampled_feats = sampled_feats * (~invalid_mask[:, :, None])

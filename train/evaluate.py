@@ -30,13 +30,16 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
 from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
+from damon_smpl import DamonSMPLDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
+from body_converter import BodyConverter
 
 
 # ---------------------------------------------------------------------------
@@ -45,9 +48,10 @@ class ContactEvaluator:
     """Evaluates per-vertex contact prediction on DAMON dataset."""
 
     def __init__(self, config_path: str, checkpoint_path: str,
-                 split: str = "val", device: str = "cuda"):
+                 split: str = "val", device: str = "cuda", mode: str = "smpl"):
         self.device = device
         self.split = split
+        self.mode = mode  # "smpl" or "mhr"
 
         self.figures_dir = Path(__file__).parent / "figures"
         self.figures_dir.mkdir(parents=True, exist_ok=True)
@@ -69,6 +73,11 @@ class ContactEvaluator:
         self.model.load_state_dict(state, strict=False)
         self.model.eval()
 
+        # Contact converter (SMPL mode only — fast, CPU is fine)
+        if self.mode == "smpl":
+            print("Initialising MHR→SMPL contact converter...")
+            self.converter = BodyConverter(device="cpu")
+
         # Dataset
         print(f"Loading {split} dataset...")
         self._setup_dataset()
@@ -80,20 +89,48 @@ class ContactEvaluator:
         val_ratio = self.cfg.DATASET.get('VAL_RATIO', 0.2)
         seed      = self.cfg.DATASET.get('SEED', 42)
 
-        if self.split == 'test':
-            test_npz = self.cfg.DATASET.get('TEST_NPZ', None)
-            if not test_npz:
-                raise ValueError("DATASET.TEST_NPZ not set in config.")
-            dataset = DamonMHRDataset(npz_path=test_npz, data_root=data_root)
+        if self.mode == "smpl":
+            # Load GT contacts from original DECO SMPL NPZ
+            smpl_trainval = self.cfg.DATASET.get('SMPL_TRAINVAL_NPZ', None)
+            smpl_test     = self.cfg.DATASET.get('SMPL_TEST_NPZ', None)
+            mhr_trainval  = self.cfg.DATASET.get('TRAINVAL_NPZ', None)
+            mhr_test      = self.cfg.DATASET.get('TEST_NPZ', None)
+
+            if self.split == 'test':
+                if not smpl_test:
+                    raise ValueError("DATASET.SMPL_TEST_NPZ not set in config.")
+                dataset = DamonSMPLDataset(
+                    smpl_npz_path=smpl_test,
+                    mhr_npz_path=mhr_test,
+                    data_root=data_root,
+                )
+            else:
+                if not smpl_trainval:
+                    raise ValueError("DATASET.SMPL_TRAINVAL_NPZ not set in config.")
+                train_ds, val_ds = DamonSMPLDataset.split_train_val(
+                    smpl_npz_path=smpl_trainval,
+                    mhr_npz_path=mhr_trainval,
+                    val_ratio=val_ratio,
+                    seed=seed,
+                    data_root=data_root,
+                )
+                dataset = train_ds if self.split == 'train' else val_ds
         else:
-            # Reproduce the exact same train/val split used during training.
-            train_ds, val_ds = DamonMHRDataset.split_train_val(
-                npz_path=self.cfg.DATASET.TRAINVAL_NPZ,
-                val_ratio=val_ratio,
-                seed=seed,
-                data_root=data_root,
-            )
-            dataset = train_ds if self.split == 'train' else val_ds
+            # MHR mode — original behaviour
+            if self.split == 'test':
+                test_npz = self.cfg.DATASET.get('TEST_NPZ', None)
+                if not test_npz:
+                    raise ValueError("DATASET.TEST_NPZ not set in config.")
+                dataset = DamonMHRDataset(npz_path=test_npz, data_root=data_root)
+            else:
+                # Reproduce the exact same train/val split used during training.
+                train_ds, val_ds = DamonMHRDataset.split_train_val(
+                    npz_path=self.cfg.DATASET.TRAINVAL_NPZ,
+                    val_ratio=val_ratio,
+                    seed=seed,
+                    data_root=data_root,
+                )
+                dataset = train_ds if self.split == 'train' else val_ds
 
         print(f"  {self.split.capitalize()} samples: {len(dataset)}")
 
@@ -119,8 +156,8 @@ class ContactEvaluator:
 
     @torch.no_grad()
     def evaluate(self, threshold: float = 0.5):
-        all_probs = []   # [N, V]
-        all_gt = []      # [N, V]
+        all_probs = []   # [N, V_mhr=18439]
+        all_gt = []      # [N, V_mhr or V_smpl]
 
         for images, bboxes, cam_ks, contact_labels in tqdm(self.loader, desc="Evaluating"):
             batch = self._prepare_batch(images, bboxes, cam_ks)
@@ -132,16 +169,43 @@ class ContactEvaluator:
             all_probs.append(probs.numpy())
             all_gt.append(contact_labels.numpy())
 
-        all_probs = np.concatenate(all_probs, axis=0)   # [N, V]
-        all_gt = np.concatenate(all_gt, axis=0).astype(bool)  # [N, V]
-        all_preds = all_probs > threshold                # [N, V]
+        all_probs = np.concatenate(all_probs, axis=0)            # [N, 18439]
+        all_gt    = np.concatenate(all_gt, axis=0).astype(bool)  # [N, V]
 
-        self._print_metrics(all_preds, all_gt, all_probs)
-        self._plot_iou_histogram(all_preds, all_gt)
-        self._plot_prob_distribution(all_probs, all_gt)
-        self._plot_roc_curve(all_probs, all_gt)
+        if self.mode == "smpl":
+            # Interpolate continuous MHR probs → SMPL space, then threshold once.
+            # We use the raw _interpolate() path so we get float values for ROC/plots.
+            print("Converting MHR predictions to SMPL space...")
+            smpl_probs = self._interpolate_probs_to_smpl(all_probs)  # [N, 6890] float
+            all_preds  = smpl_probs > threshold                       # [N, 6890] bool
+            self._print_metrics(all_preds, all_gt, smpl_probs)
+            self._plot_iou_histogram(all_preds, all_gt)
+            self._plot_prob_distribution(smpl_probs, all_gt)
+            self._plot_roc_curve(smpl_probs, all_gt)
+            return smpl_probs, all_preds, all_gt
+        else:
+            all_preds = all_probs > threshold    # [N, 18439]
+            self._print_metrics(all_preds, all_gt, all_probs)
+            self._plot_iou_histogram(all_preds, all_gt)
+            self._plot_prob_distribution(all_probs, all_gt)
+            self._plot_roc_curve(all_probs, all_gt)
+            return all_probs, all_preds, all_gt
 
-        return all_probs, all_preds, all_gt
+    def _interpolate_probs_to_smpl(self, mhr_probs: np.ndarray) -> np.ndarray:
+        """
+        Interpolate continuous MHR probabilities [N, 18439] → SMPL [N, 6890].
+
+        Uses the raw _interpolate() path so we get float values (not yet
+        thresholded) suitable for ROC and probability-distribution plots.
+        """
+        probs_t = torch.from_numpy(mhr_probs)  # [N, 18439] float32
+        interp = self.converter._interpolate(
+            probs_t,
+            self.converter._m2s_tri_ids,
+            self.converter._m2s_baryc,
+            self.converter._mhr_faces,
+        )
+        return interp.numpy()  # [N, 6890]
 
     # ------------------------------------------------------------------
     # Metric reporting
@@ -264,11 +328,16 @@ def main():
                         help="Dataset split to evaluate on")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Binary threshold for contact probability")
+    parser.add_argument("--mode", type=str, default="smpl",
+                        choices=["smpl", "mhr"],
+                        help="Mesh topology for metrics: 'smpl' (6890 verts, default) "
+                             "or 'mhr' (18439 verts)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     evaluator = ContactEvaluator(
-        args.config, args.checkpoint, split=args.split, device=args.device
+        args.config, args.checkpoint,
+        split=args.split, device=args.device, mode=args.mode,
     )
     evaluator.evaluate(threshold=args.threshold)
     print("\nEvaluation complete.")

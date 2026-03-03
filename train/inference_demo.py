@@ -37,6 +37,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
@@ -44,6 +45,7 @@ from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
+from body_converter import BodyConverter
 
 
 # ---------------------------------------------------------------------------
@@ -201,11 +203,29 @@ def make_figure(image: np.ndarray,
                 gt_mask: np.ndarray,
                 pred_mask: np.ndarray,
                 iou: float,
-                sample_idx: int) -> plt.Figure:
+                sample_idx: int,
+                tpose_faces: np.ndarray | None = None,
+                tpose_gt_mask: np.ndarray | None = None,
+                tpose_pred_mask: np.ndarray | None = None) -> plt.Figure:
     """
     Row 0 (3 panels): plain image | GT mesh overlay | Pred mesh overlay
     Row 1 (4 panels): GT T-pose (front+back)  |gap|  Pred T-pose (front+back)
+
+    Args:
+        tpose_faces:     Face connectivity for lower-row T-pose rendering.
+            Defaults to ``faces`` (same mesh as 2D overlay).
+        tpose_gt_mask:   Per-vertex contact mask for lower-row GT panels.
+            Defaults to ``gt_mask``.
+        tpose_pred_mask: Per-vertex contact mask for lower-row Pred panels.
+            Defaults to ``pred_mask``.
     """
+    if tpose_faces is None:
+        tpose_faces = faces
+    if tpose_gt_mask is None:
+        tpose_gt_mask = gt_mask
+    if tpose_pred_mask is None:
+        tpose_pred_mask = pred_mask
+
     fig = plt.figure(figsize=(22, 10), dpi=200)
     fig.suptitle(
         f"Sample #{sample_idx}  |  IoU={iou:.3f}  "
@@ -233,9 +253,9 @@ def make_figure(image: np.ndarray,
     ax_img.set_axis_off()
 
     overlay_mesh_on_image_2d(ax_gt2d, image, verts_2d, verts_3d_cam,
-                              faces, gt_mask, title="GT contact")
+                              faces, gt_mask, title="GT contact (MHR)")
     overlay_mesh_on_image_2d(ax_pr2d, image, verts_2d, verts_3d_cam,
-                              faces, pred_mask, title="Pred contact")
+                              faces, pred_mask, title="Pred contact (MHR)")
 
     # ---- Row 1: GT pair (left) | gap | Pred pair (right) ---------------------
     # Remap T-pose verts: OpenCV (X right, Y down, Z depth) →
@@ -246,8 +266,8 @@ def make_figure(image: np.ndarray,
 
     sfig_gt, sfig_pr = sfig_bot.subfigures(1, 2, wspace=0.12)
 
-    sfig_gt.suptitle("Ground Truth", fontsize=11, fontweight="bold", y=0.97)
-    sfig_pr.suptitle("Prediction",   fontsize=11, fontweight="bold", y=0.97)
+    sfig_gt.suptitle("Ground Truth (SMPL)", fontsize=11, fontweight="bold", y=0.97)
+    sfig_pr.suptitle("Prediction (SMPL)",   fontsize=11, fontweight="bold", y=0.97)
 
     gs_gt = sfig_gt.add_gridspec(1, 2, wspace=0.01,
                                   left=0.02, right=0.98, top=0.88, bottom=0.02)
@@ -259,13 +279,13 @@ def make_figure(image: np.ndarray,
     ax_pr_front = sfig_pr.add_subplot(gs_pr[0], projection="3d")
     ax_pr_back  = sfig_pr.add_subplot(gs_pr[1], projection="3d")
 
-    render_mesh_3d(ax_gt_front, tv, faces, gt_mask,
+    render_mesh_3d(ax_gt_front, tv, tpose_faces, tpose_gt_mask,
                    title="Front", elev=0, azim=-90)
-    render_mesh_3d(ax_gt_back,  tv, faces, gt_mask,
+    render_mesh_3d(ax_gt_back,  tv, tpose_faces, tpose_gt_mask,
                    title="Back",  elev=0, azim=90)
-    render_mesh_3d(ax_pr_front, tv, faces, pred_mask,
+    render_mesh_3d(ax_pr_front, tv, tpose_faces, tpose_pred_mask,
                    title="Front", elev=0, azim=-90)
-    render_mesh_3d(ax_pr_back,  tv, faces, pred_mask,
+    render_mesh_3d(ax_pr_back,  tv, tpose_faces, tpose_pred_mask,
                    title="Back",  elev=0, azim=90)
 
     return fig
@@ -320,10 +340,26 @@ def main():
     model.load_state_dict(state, strict=False)
     model.eval()
 
-    # Mesh faces: [F, 3]
+    # MHR mesh faces: [F, 3]  — used for 2D overlay (row 0)
     faces = model.head_pose.faces.cpu().numpy().astype(np.int32)
 
+    # ---- SMPL template for lower-row (row 1) 3-D rendering ----
+    print("Loading SMPL template...")
+    smpl_model_path = cfg.MODEL.get("SMPL_MODEL_PATH", None)
+    if smpl_model_path is None:
+        smpl_model_path = "/data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz"
+        print(f"  MODEL.SMPL_MODEL_PATH not set; using default: {smpl_model_path}")
+    smpl_npz = np.load(smpl_model_path, allow_pickle=True)
+    smpl_template_verts = smpl_npz["v_template"].astype(np.float32)   # [6890, 3]
+    smpl_faces          = smpl_npz["f"].astype(np.int32)               # [13776, 3]
+
+    # ---- Contact converter (MHR → SMPL) ----
+    print("Initialising MHR→SMPL contact converter...")
+    converter = BodyConverter(device="cpu")
+
     # ---- Dataset ----
+    # Use MHR dataset for images/bbox/cam_k.  GT contacts come from SMPL NPZ
+    # and are converted to SMPL space below.
     data_root = cfg.DATASET.get("DATA_ROOT", None)
     val_ratio = cfg.DATASET.get("VAL_RATIO", 0.2)
     seed_ds   = cfg.DATASET.get("SEED", 42)
@@ -365,61 +401,63 @@ def main():
             model._initialize_batch(batch)
             output = model.forward_step(batch, decoder_type="body")
 
-        # ---- Contact predictions ----
+        # ---- Contact predictions (MHR space) ----
         contact_logits = output["contact"]["contact_logits"]  # [1, 18439]
-        pred_probs = torch.sigmoid(contact_logits)[0].cpu().numpy()  # [18439]
-        pred_mask = pred_probs > args.threshold                       # [18439] bool
-        gt_mask   = contact_label.numpy().astype(bool)                # [18439] bool
+        pred_probs_mhr = torch.sigmoid(contact_logits)[0].cpu().numpy()  # [18439]
+        pred_mask_mhr  = pred_probs_mhr > args.threshold                  # [18439] bool
+        gt_mask_mhr    = contact_label.numpy().astype(bool)               # [18439] bool
 
-        # ---- 3D T-pose vertices (zero pose, same shape/scale as prediction) ----
-        with torch.no_grad():
-            pred_shape = output["mhr"]["shape"]   # [1, 45]
-            pred_scale = output["mhr"]["scale"]   # [1, 28]
-            pred_face  = output["mhr"]["face"]    # [1, 72]
-            tpose_verts = model.head_pose.mhr_forward(
-                global_trans=torch.zeros(1, 3, device=args.device),
-                global_rot=torch.zeros(1, 3, device=args.device),
-                body_pose_params=torch.zeros(1, 130, device=args.device),
-                hand_pose_params=None,
-                scale_params=pred_scale,
-                shape_params=pred_shape,
-                expr_params=pred_face,
-            )
-        verts_3d_tpose = tpose_verts[0].cpu().numpy()   # [18439, 3]
-        verts_3d_tpose[:, [1, 2]] *= -1                 # camera system correction
+        # ---- Convert contacts to SMPL space (for lower-row + IoU) ----
+        pred_mask_smpl = converter.mhr_to_smpl(
+            contacts=torch.from_numpy(pred_probs_mhr).unsqueeze(0),
+            threshold=args.threshold,
+        ).contacts[0].numpy().astype(bool)                                 # [6890] bool
+
+        gt_mask_smpl = converter.mhr_to_smpl(
+            contacts=torch.from_numpy(gt_mask_mhr.astype(np.float32)).unsqueeze(0),
+            threshold=0.5,
+        ).contacts[0].numpy().astype(bool)                                 # [6890] bool
+
+        # ---- SMPL T-pose template for lower row ----
+        # Apply the same Y/Z-flip as was previously used for MHR T-pose verts
+        # (converts Y-up model coords to the convention expected by make_figure).
+        verts_3d_tpose = smpl_template_verts.copy()
+        verts_3d_tpose[:, [1, 2]] *= -1   # [6890, 3]
 
         # ---- 3D posed vertices + 2D projection ----
-        # pred_vertices are root-centered; pred_cam_t places them in camera space.
-        # The model's camera_project() already computes the correct pixel projection
-        # and stores it in pred_keypoints_2d_verts — use that directly.
         verts_3d_posed = output["mhr"]["pred_vertices"][0].cpu().numpy()     # [V, 3]
         pred_cam_t_np  = output["mhr"]["pred_cam_t"][0].cpu().numpy()        # [3]
         verts_3d_cam   = verts_3d_posed + pred_cam_t_np                      # [V, 3] camera space
         verts_2d       = output["mhr"]["pred_keypoints_2d_verts"][0].cpu().numpy()  # [V, 2] pixels
 
-        # ---- IoU ----
-        tp = (pred_mask & gt_mask).sum()
-        fp = (pred_mask & ~gt_mask).sum()
-        fn = (~pred_mask & gt_mask).sum()
+        # ---- IoU (SMPL space) ----
+        tp = (pred_mask_smpl & gt_mask_smpl).sum()
+        fp = (pred_mask_smpl & ~gt_mask_smpl).sum()
+        fn = (~pred_mask_smpl & gt_mask_smpl).sum()
         iou = float(tp) / (tp + fp + fn + 1e-8)
         ious.append(iou)
 
-        print(f"  GT contacts:   {gt_mask.sum()}")
-        print(f"  Pred contacts: {pred_mask.sum()}")
-        print(f"  IoU:           {iou:.4f}")
+        print(f"  GT contacts (SMPL):   {gt_mask_smpl.sum()}")
+        print(f"  Pred contacts (SMPL): {pred_mask_smpl.sum()}")
+        print(f"  IoU (SMPL):           {iou:.4f}")
 
         # ---- Figure ----
+        # Row 0: 2D overlay uses MHR mesh (matches model output topology)
+        # Row 1: 3D T-pose uses SMPL template mesh with SMPL-space contact masks
         fig = make_figure(
-            image          = image_np,
-            bbox           = bbox.numpy(),
-            verts_2d       = verts_2d,
-            verts_3d_cam   = verts_3d_cam,
-            verts_3d_tpose = verts_3d_tpose,
-            faces          = faces,
-            gt_mask        = gt_mask,
-            pred_mask      = pred_mask,
-            iou            = iou,
-            sample_idx     = ds_idx,
+            image           = image_np,
+            bbox            = bbox.numpy(),
+            verts_2d        = verts_2d,
+            verts_3d_cam    = verts_3d_cam,
+            verts_3d_tpose  = verts_3d_tpose,
+            faces           = faces,            # MHR faces for 2D overlay
+            gt_mask         = gt_mask_mhr,      # MHR mask for 2D overlay
+            pred_mask       = pred_mask_mhr,    # MHR mask for 2D overlay
+            iou             = iou,
+            sample_idx      = ds_idx,
+            tpose_faces     = smpl_faces,       # SMPL faces for lower row
+            tpose_gt_mask   = gt_mask_smpl,     # SMPL mask for lower row GT
+            tpose_pred_mask = pred_mask_smpl,   # SMPL mask for lower row Pred
         )
 
         save_path = output_dir / f"sample_{run_idx:04d}_idx{ds_idx}_iou{iou:.3f}.png"
@@ -429,7 +467,7 @@ def main():
 
     # ---- Summary ----
     print(f"\n{'='*60}")
-    print(f"Done.  {len(ious)} samples  |  mean IoU = {np.mean(ious):.4f}  "
+    print(f"Done.  {len(ious)} samples  |  mean IoU (SMPL) = {np.mean(ious):.4f}  "
           f"(median {np.median(ious):.4f})")
     print(f"Figures saved to: {output_dir.resolve()}")
 
