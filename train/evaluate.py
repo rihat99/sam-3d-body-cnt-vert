@@ -17,7 +17,9 @@ Usage:
 
 import os
 import sys
+import json
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -52,6 +54,7 @@ class ContactEvaluator:
         self.device = device
         self.split = split
         self.mode = mode  # "smpl" or "mhr"
+        self.checkpoint_path = Path(checkpoint_path)
 
         self.figures_dir = Path(__file__).parent / "figures"
         self.figures_dir.mkdir(parents=True, exist_ok=True)
@@ -77,6 +80,11 @@ class ContactEvaluator:
         if self.mode == "smpl":
             print("Initialising MHR→SMPL contact converter...")
             self.converter = BodyConverter(device="cpu")
+
+            # Geodesic distance matrix for SMPL (6890 × 6890)
+            geo_dist_path = Path(__file__).parent.parent / "data" / "smpl_neutral_geodesic_dist.npy"
+            print(f"Loading SMPL geodesic distance matrix: {geo_dist_path}")
+            self.geo_dist_matrix = torch.from_numpy(np.load(geo_dist_path)).float()  # CPU
 
         # Dataset
         print(f"Loading {split} dataset...")
@@ -178,17 +186,19 @@ class ContactEvaluator:
             print("Converting MHR predictions to SMPL space...")
             smpl_probs = self._interpolate_probs_to_smpl(all_probs)  # [N, 6890] float
             all_preds  = smpl_probs > threshold                       # [N, 6890] bool
-            self._print_metrics(all_preds, all_gt, smpl_probs)
+            metrics = self._print_metrics(all_preds, all_gt, smpl_probs, threshold)
             self._plot_iou_histogram(all_preds, all_gt)
             self._plot_prob_distribution(smpl_probs, all_gt)
-            self._plot_roc_curve(smpl_probs, all_gt)
+            roc_auc = self._plot_roc_curve(smpl_probs, all_gt)
+            self._save_results(metrics, roc_auc, threshold)
             return smpl_probs, all_preds, all_gt
         else:
             all_preds = all_probs > threshold    # [N, 18439]
-            self._print_metrics(all_preds, all_gt, all_probs)
+            metrics = self._print_metrics(all_preds, all_gt, all_probs, threshold)
             self._plot_iou_histogram(all_preds, all_gt)
             self._plot_prob_distribution(all_probs, all_gt)
-            self._plot_roc_curve(all_probs, all_gt)
+            roc_auc = self._plot_roc_curve(all_probs, all_gt)
+            self._save_results(metrics, roc_auc, threshold)
             return all_probs, all_preds, all_gt
 
     def _interpolate_probs_to_smpl(self, mhr_probs: np.ndarray) -> np.ndarray:
@@ -211,37 +221,163 @@ class ContactEvaluator:
     # Metric reporting
     # ------------------------------------------------------------------
 
-    def _print_metrics(self, preds, gt, probs):
-        tp = (preds & gt).sum()
-        fp = (preds & ~gt).sum()
-        fn = (~preds & gt).sum()
-        tn = (~preds & ~gt).sum()
+    def _print_metrics(self, preds, gt, probs, threshold: float = 0.5) -> dict:
+        # ------------------------------------------------------------------
+        # Global pooled metrics (aggregate TP/FP/FN over all samples)
+        # ------------------------------------------------------------------
+        tp_g = (preds & gt).sum()
+        fp_g = (preds & ~gt).sum()
+        fn_g = (~preds & gt).sum()
+        tn_g = (~preds & ~gt).sum()
 
-        accuracy  = (tp + tn) / (tp + tn + fp + fn + 1e-8)
-        precision = tp / (tp + fp + 1e-8)
-        recall    = tp / (tp + fn + 1e-8)
-        f1        = 2 * precision * recall / (precision + recall + 1e-8)
-        iou       = tp / (tp + fp + fn + 1e-8)
+        accuracy       = (tp_g + tn_g) / (tp_g + tn_g + fp_g + fn_g + 1e-10)
+        global_precision = tp_g / (tp_g + fp_g + 1e-10)
+        global_recall    = tp_g / (tp_g + fn_g + 1e-10)
+        global_f1        = 2 * global_precision * global_recall / (global_precision + global_recall + 1e-10)
+        global_iou       = tp_g / (tp_g + fp_g + fn_g + 1e-10)
 
-        # Per-sample IoU
-        per_sample_tp = (preds & gt).sum(axis=1)
-        per_sample_fp = (preds & ~gt).sum(axis=1)
-        per_sample_fn = (~preds & gt).sum(axis=1)
-        per_sample_iou = per_sample_tp / (per_sample_tp + per_sample_fp + per_sample_fn + 1e-8)
+        # ------------------------------------------------------------------
+        # Per-sample averaged metrics (matches InteractVLM get_h_contact_metrics)
+        # Each sample contributes equally regardless of contact region size.
+        # ------------------------------------------------------------------
+        per_tp = (preds & gt).sum(axis=1).astype(float)
+        per_fp = (preds & ~gt).sum(axis=1).astype(float)
+        per_fn = (~preds & gt).sum(axis=1).astype(float)
 
+        per_precision = per_tp / (per_tp + per_fp + 1e-10)
+        per_recall    = per_tp / (per_tp + per_fn + 1e-10)
+        per_f1        = 2 * per_precision * per_recall / (per_precision + per_recall + 1e-10)
+        per_iou       = per_tp / (per_tp + per_fp + per_fn + 1e-10)
+
+        mean_precision = per_precision.mean()
+        mean_recall    = per_recall.mean()
+        mean_f1        = per_f1.mean()
+        mean_iou       = per_iou.mean()
+
+        # ------------------------------------------------------------------
+        # Geodesic distance (SMPL only)
+        # ------------------------------------------------------------------
+        geo_results = {}
+        if self.mode == "smpl":
+            fp_geo, fn_geo = self._compute_geo_distance(preds, gt, threshold)
+            geo_results = {"fp_geo": fp_geo, "fn_geo": fn_geo}
+        else:
+            print("WARNING: Geodesic distance metric not supported for MHR topology "
+                  "(no precomputed distance matrix available).")
+
+        # ------------------------------------------------------------------
+        # Print
+        # ------------------------------------------------------------------
         print("\n" + "=" * 70)
-        print(f"EVALUATION RESULTS  [{self.split}]")
+        print(f"EVALUATION RESULTS  [{self.split}]  (mode={self.mode})")
         print("=" * 70)
-        print(f"  Accuracy : {accuracy:.4f}")
-        print(f"  Precision: {precision:.4f}")
-        print(f"  Recall   : {recall:.4f}")
-        print(f"  F1       : {f1:.4f}")
-        print(f"  IoU      : {iou:.4f}")
-        print(f"  Mean per-sample IoU: {per_sample_iou.mean():.4f}  "
-              f"(median: {np.median(per_sample_iou):.4f})")
-        print(f"  GT contact rate : {gt.mean():.4f}")
+        print(f"  --- Per-sample averaged (matches InteractVLM) ---")
+        print(f"  F1        : {mean_f1:.4f}")
+        print(f"  Precision : {mean_precision:.4f}")
+        print(f"  Recall    : {mean_recall:.4f}")
+        print(f"  Mean IoU  : {mean_iou:.4f}  (median: {np.median(per_iou):.4f})")
+        if geo_results:
+            print(f"  FP Geo Dist: {geo_results['fp_geo']:.4f}")
+            print(f"  FN Geo Dist: {geo_results['fn_geo']:.4f}")
+        print(f"  --- Global pooled ---")
+        print(f"  Accuracy  : {accuracy:.4f}")
+        print(f"  Precision : {global_precision:.4f}")
+        print(f"  Recall    : {global_recall:.4f}")
+        print(f"  F1        : {global_f1:.4f}")
+        print(f"  IoU       : {global_iou:.4f}")
+        print(f"  GT contact rate  : {gt.mean():.4f}")
         print(f"  Pred contact rate: {preds.mean():.4f}")
         print("=" * 70)
+
+        result = {
+            # Per-sample averaged (primary — matches InteractVLM)
+            "mean_f1":               float(mean_f1),
+            "mean_precision":        float(mean_precision),
+            "mean_recall":           float(mean_recall),
+            "mean_iou":              float(mean_iou),
+            "median_iou":            float(np.median(per_iou)),
+            # Geodesic distance (SMPL only)
+            **{k: float(v) for k, v in geo_results.items()},
+            # Global pooled (for reference)
+            "global_accuracy":       float(accuracy),
+            "global_precision":      float(global_precision),
+            "global_recall":         float(global_recall),
+            "global_f1":             float(global_f1),
+            "global_iou":            float(global_iou),
+            # Meta
+            "gt_contact_rate":       float(gt.mean()),
+            "pred_contact_rate":     float(preds.mean()),
+            "num_samples":           int(preds.shape[0]),
+        }
+        return result
+
+    # ------------------------------------------------------------------
+
+    def _compute_geo_distance(self, preds: np.ndarray, gt: np.ndarray,
+                               threshold: float = 0.5):
+        """
+        Compute mean geodesic distance between predicted and GT contact vertices.
+
+        Matches InteractVLM's get_h_geo_metric():
+          - fp_geo: for each predicted contact vertex, min dist to nearest GT contact
+                    vertex, averaged → how far off false positives are
+          - fn_geo: for each GT contact vertex, min dist to nearest predicted contact
+                    vertex, averaged → how far away missed contacts are
+
+        Args:
+            preds: bool array [N, 6890]
+            gt:    bool array [N, 6890]
+            threshold: not used (preds already thresholded), kept for API symmetry
+
+        Returns:
+            fp_geo, fn_geo  (scalars, averaged over N samples)
+        """
+        dist_matrix = self.geo_dist_matrix  # [6890, 6890] float, CPU torch tensor
+        N = preds.shape[0]
+        fp_dists = np.zeros(N, dtype=float)
+        fn_dists = np.zeros(N, dtype=float)
+
+        for b in range(N):
+            gt_mask   = torch.from_numpy(gt[b].astype(bool))    # [6890]
+            pred_mask = torch.from_numpy(preds[b].astype(bool)) # [6890]
+
+            # Columns = GT contact vertices; fallback to full matrix if no GT contacts
+            gt_cols = dist_matrix[:, gt_mask] if gt_mask.any() else dist_matrix
+
+            # Rows = predicted contact vertices; fallback to gt_cols if no predictions
+            err_mat = gt_cols[pred_mask, :] if pred_mask.any() else gt_cols
+
+            # FP geo: avg min dist from each predicted contact to nearest GT contact
+            fp_dists[b] = err_mat.min(dim=1).values.mean().item()
+            # FN geo: avg min dist from each GT contact to nearest predicted contact
+            fn_dists[b] = err_mat.min(dim=0).values.mean().item()
+
+        return float(fp_dists.mean()), float(fn_dists.mean())
+
+    def _save_results(self, metrics: dict, roc_auc: float, threshold: float):
+        """Append/update eval_results.json in the checkpoint directory."""
+        out_path = self.checkpoint_path.parent / "eval_results.json"
+
+        # Load existing results (other splits may already be present)
+        if out_path.exists():
+            with open(out_path) as f:
+                all_results = json.load(f)
+        else:
+            all_results = {}
+
+        all_results[self.split] = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "checkpoint": str(self.checkpoint_path),
+            "mode": self.mode,
+            "threshold": threshold,
+            **metrics,
+            "roc_auc": roc_auc,
+        }
+
+        with open(out_path, "w") as f:
+            json.dump(all_results, f, indent=2)
+
+        print(f"Results saved → {out_path}")
 
     # ------------------------------------------------------------------
     # Plots

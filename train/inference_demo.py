@@ -84,9 +84,9 @@ def _face_colors(contact_mask: np.ndarray, faces: np.ndarray,
 
     face_hit = contact_mask[faces].any(axis=1)          # [F]
 
-    ambient  = 0.40
+    ambient  = 0.38
     i_key    = np.clip(normals @ key,  0, 1)            # [F]
-    i_fill   = np.clip(normals @ fill, 0, 1) * 0.40    # [F]
+    i_fill   = np.clip(normals @ fill, 0, 1) * 0.70    # [F]
     shading  = np.clip(ambient + i_key + i_fill, 0, 1) # [F]
 
     base_rgb = np.where(
@@ -132,7 +132,7 @@ def render_mesh_3d(ax, vertices: np.ndarray, faces: np.ndarray,
     # Equal span for X (width) and Z (height); proportional Y (depth)
     xlo, xhi = vertices[:, 0].min(), vertices[:, 0].max()
     zlo, zhi = vertices[:, 2].min(), vertices[:, 2].max()
-    span = max(xhi - xlo, zhi - zlo) * 0.505
+    span = max(xhi - xlo, zhi - zlo) * 0.38   # tighter → mesh fills more viewport
     xmid, zmid = (xhi + xlo) / 2, (zhi + zlo) / 2
     ax.set_xlim(xmid - span, xmid + span)
     ax.set_zlim(zmid - span, zmid + span)
@@ -145,7 +145,8 @@ def render_mesh_3d(ax, vertices: np.ndarray, faces: np.ndarray,
     ax.set_box_aspect([1, y_ratio, 1])
 
     ax.view_init(elev=elev, azim=azim)
-    ax.set_title(title, fontsize=9)
+    ax.dist = 4  # zoom in (default=10)
+    ax.set_title(title, fontsize=13)
     ax.set_axis_off()
 
 
@@ -186,7 +187,7 @@ def overlay_mesh_on_image_2d(ax, image: np.ndarray,
 
     ax.set_xlim(0, image.shape[1])
     ax.set_ylim(image.shape[0], 0)   # flip Y for image coordinates
-    ax.set_title(title, fontsize=9)
+    ax.set_title(title, fontsize=13)
     ax.set_axis_off()
 
 
@@ -226,19 +227,19 @@ def make_figure(image: np.ndarray,
     if tpose_pred_mask is None:
         tpose_pred_mask = pred_mask
 
-    fig = plt.figure(figsize=(22, 10), dpi=200)
+    fig = plt.figure(figsize=(22, 13), dpi=300)
     fig.suptitle(
         f"Sample #{sample_idx}  |  IoU={iou:.3f}  "
         f"GT contacts={gt_mask.sum()}  Pred contacts={pred_mask.sum()}",
-        fontsize=12, y=0.995,
+        fontsize=16, y=0.995,
     )
 
     # ── Subfigures: top row + bottom row ──────────────────────────────────────
-    sfig_top, sfig_bot = fig.subfigures(2, 1, height_ratios=[1, 1.1], hspace=0.04)
+    sfig_top, sfig_bot = fig.subfigures(2, 1, height_ratios=[1, 1.6], hspace=0.02)
 
     # ---- Row 0: 3 equal panels -----------------------------------------------
     gs_top = sfig_top.add_gridspec(1, 3, wspace=0.03,
-                                   left=0.01, right=0.99, top=0.92, bottom=0.06)
+                                   left=0.01, right=0.99, top=0.84, bottom=0.06)
     ax_img  = sfig_top.add_subplot(gs_top[0])
     ax_gt2d = sfig_top.add_subplot(gs_top[1])
     ax_pr2d = sfig_top.add_subplot(gs_top[2])
@@ -249,7 +250,7 @@ def make_figure(image: np.ndarray,
         (x1, y1), x2 - x1, y2 - y1,
         linewidth=1.5, edgecolor=COLOR_BBOX, facecolor="none",
     ))
-    ax_img.set_title("Input image", fontsize=10)
+    ax_img.set_title("Input image", fontsize=14)
     ax_img.set_axis_off()
 
     overlay_mesh_on_image_2d(ax_gt2d, image, verts_2d, verts_3d_cam,
@@ -266,13 +267,21 @@ def make_figure(image: np.ndarray,
 
     sfig_gt, sfig_pr = sfig_bot.subfigures(1, 2, wspace=0.12)
 
-    sfig_gt.suptitle("Ground Truth (SMPL)", fontsize=11, fontweight="bold", y=0.97)
-    sfig_pr.suptitle("Prediction (SMPL)",   fontsize=11, fontweight="bold", y=0.97)
+    # Vertical separator between GT and Pred halves
+    from matplotlib.lines import Line2D
+    sfig_bot.add_artist(Line2D(
+        [0.5, 0.5], [0.03, 0.97],
+        transform=sfig_bot.transSubfigure,
+        color="#888888", linewidth=1.5, linestyle="--",
+    ))
+
+    sfig_gt.suptitle("Ground Truth (SMPL)", fontsize=15, fontweight="bold", y=0.97)
+    sfig_pr.suptitle("Prediction (SMPL)",   fontsize=15, fontweight="bold", y=0.97)
 
     gs_gt = sfig_gt.add_gridspec(1, 2, wspace=0.01,
-                                  left=0.02, right=0.98, top=0.88, bottom=0.02)
+                                  left=0.01, right=0.99, top=0.92, bottom=0.00)
     gs_pr = sfig_pr.add_gridspec(1, 2, wspace=0.01,
-                                  left=0.02, right=0.98, top=0.88, bottom=0.02)
+                                  left=0.01, right=0.99, top=0.92, bottom=0.00)
 
     ax_gt_front = sfig_gt.add_subplot(gs_gt[0], projection="3d")
     ax_gt_back  = sfig_gt.add_subplot(gs_gt[1], projection="3d")
@@ -280,13 +289,13 @@ def make_figure(image: np.ndarray,
     ax_pr_back  = sfig_pr.add_subplot(gs_pr[1], projection="3d")
 
     render_mesh_3d(ax_gt_front, tv, tpose_faces, tpose_gt_mask,
-                   title="Front", elev=0, azim=-90)
+                   title="Front", elev=30, azim=-90)
     render_mesh_3d(ax_gt_back,  tv, tpose_faces, tpose_gt_mask,
-                   title="Back",  elev=0, azim=90)
+                   title="Back",  elev=-30, azim=90)
     render_mesh_3d(ax_pr_front, tv, tpose_faces, tpose_pred_mask,
-                   title="Front", elev=0, azim=-90)
+                   title="Front", elev=30, azim=-90)
     render_mesh_3d(ax_pr_back,  tv, tpose_faces, tpose_pred_mask,
-                   title="Back",  elev=0, azim=90)
+                   title="Back",  elev=-30, azim=90)
 
     return fig
 
@@ -461,7 +470,7 @@ def main():
         )
 
         save_path = output_dir / f"sample_{run_idx:04d}_idx{ds_idx}_iou{iou:.3f}.png"
-        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+        fig.savefig(save_path, bbox_inches="tight")
         plt.close(fig)
         print(f"  Saved: {save_path}")
 
