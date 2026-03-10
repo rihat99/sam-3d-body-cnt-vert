@@ -1,6 +1,6 @@
 MODEL:
-  CHECKPOINT_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
-  MHR_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
+  CHECKPOINT_PATH: /home/rikhat/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/model.ckpt
+  MHR_MODEL_PATH: /home/rikhat/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
   IMAGE_SIZE:
   - 896
   - 896
@@ -42,9 +42,9 @@ MODEL:
     PROMPT_KEYPOINTS: mhr70
     MASK_EMBED_TYPE: null
   # SMPL model for T-pose template vertices and face connectivity (used in inference_demo.py)
-  SMPL_MODEL_PATH: /data3/rikhat.akizhanov/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
+  SMPL_MODEL_PATH: /home/rikhat/human_global_motion/better_human/models/smpl/SMPL_NEUTRAL.npz
   MHR_HEAD:
-    MHR_MODEL_PATH: ''
+    MHR_MODEL_PATH: /home/rikhat/human_global_motion/data/sam-3d-body-checkpoints/sam-3d-body-dinov3/assets/mhr_model.pt
     MLP_DEPTH: 1
     MLP_CHANNEL_DIV_FACTOR: 1
   PERSON_HEAD:
@@ -77,15 +77,15 @@ TRAIN:
   RESUME: null
 DATASET:
   # Combined train+val npz — split by index with VAL_RATIO / SEED.
-  TRAINVAL_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz
+  TRAINVAL_NPZ: /home/rikhat/human_global_motion/datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz
   # Held-out test set (separate npz file).
-  TEST_NPZ: /data3/rikhat.akizhanov/human_global_motion/datasets/daimon_mhr_contact/hot_dca_test_mhr.npz
+  TEST_NPZ: /home/rikhat/human_global_motion/datasets/daimon_mhr_contact/hot_dca_test_mhr.npz
   # Original DECO NPZs with SMPL (6890-vertex) contact labels — used for SMPL-space evaluation.
-  SMPL_TRAINVAL_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
-  SMPL_TEST_NPZ: /data3/rikhat.akizhanov/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz
+  SMPL_TRAINVAL_NPZ: /media/rikhat/Hard/datasets/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
+  SMPL_TEST_NPZ: /media/rikhat/Hard/datasets/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz
   # Root directory containing the 'datasets/' folder referenced in imgname.
   # Leave null to use DAMON_DATA_ROOT env var or auto-detect from npz_path.
-  DATA_ROOT: /data3/rikhat.akizhanov/DECO
+  DATA_ROOT: /media/rikhat/Hard/datasets/DECO
   # Fraction of TRAINVAL samples held out for validation.
   VAL_RATIO: 0.2
   # Fixed random seed — ensures identical train/val split across all runs.
