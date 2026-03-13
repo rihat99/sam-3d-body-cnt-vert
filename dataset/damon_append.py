@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-Append predicted bounding boxes and camera parameters to Damon MHR dataset.
+Produce detect NPZ files (bbox + cam_k) for the Damon dataset.
 
 This script:
-1. Loads images from the Damon dataset
+1. Loads a source NPZ that contains at least 'imgname'
 2. Uses ViTDet to detect human bounding boxes
 3. Uses MoGe2 to estimate camera intrinsics
 4. Selects the largest bbox if multiple humans are detected
-5. Appends bbox and cam_k to the NPZ files
+5. Saves a separate detect NPZ: imgname, bbox, cam_k
+
+The detect file is LOD-independent and can be paired with any
+contact_lod<N>.npz file produced by convert_damon.py.
+
+Output filename convention: {base}_detect.npz
 """
 
 import os
@@ -66,17 +71,12 @@ def process_dataset(
     print(f"Processing: {os.path.basename(npz_path)}")
     print(f"{'='*80}")
     
-    # Load existing dataset
+    # Load source NPZ (needs at least 'imgname')
     data = np.load(npz_path, allow_pickle=True)
     imgnames = data['imgname']
     num_samples = len(imgnames)
-    
+
     print(f"Number of samples: {num_samples}")
-    
-    # Check if already processed
-    if 'bbox' in data.keys() and 'cam_k' in data.keys():
-        print("Warning: Dataset already contains 'bbox' and 'cam_k' fields.")
-        print("They will be overwritten.")
     
     # Initialize arrays for new data
     bboxes = np.zeros((num_samples, 4), dtype=np.float32)
@@ -160,18 +160,9 @@ def process_dataset(
         print(f"  Focal length: fx={cam_ks[i][0,0]:.1f}, fy={cam_ks[i][1,1]:.1f}")
         print(f"  Principal point: cx={cam_ks[i][0,2]:.1f}, cy={cam_ks[i][1,2]:.1f}")
     
-    # Create output dictionary with all data
-    output_data = {}
-    for key in data.keys():
-        output_data[key] = data[key]
-    
-    # Add new fields
-    output_data['bbox'] = bboxes
-    output_data['cam_k'] = cam_ks
-    
-    # Save updated dataset
-    print(f"\nSaving updated dataset to: {output_path}")
-    np.savez(output_path, **output_data)
+    # Save detect-only file (imgname + bbox + cam_k)
+    print(f"\nSaving detect dataset to: {output_path}")
+    np.savez(output_path, imgname=imgnames, bbox=bboxes, cam_k=cam_ks)
     
     # Verify saved data
     print("\nVerifying saved data...")
@@ -219,11 +210,6 @@ def main():
         default="moge2",
         help="FOV estimator name (moge2)"
     )
-    parser.add_argument(
-        "--inplace",
-        action="store_true",
-        help="Update files in place (default: create _with_bbox suffix)"
-    )
     args = parser.parse_args()
     
     print("="*80)
@@ -249,27 +235,23 @@ def main():
     
     print("✓ Models loaded successfully")
     
-    # Find NPZ files
+    # Find source NPZ files (can be combined _mhr.npz or contact-only files)
     dataset_files = [
-        "hot_dca_trainval_mhr.npz",
-        "hot_dca_test_mhr.npz"
+        "hot_dca_trainval_contact_lod1.npz",
+        "hot_dca_test_contact_lod1.npz",
     ]
-    
+
     # Process each dataset file
     for dataset_file in dataset_files:
         npz_path = os.path.join(args.dataset_dir, dataset_file)
-        
+
         if not os.path.exists(npz_path):
             print(f"\nSkipping {dataset_file} (not found)")
             continue
-        
-        # Determine output path
-        if args.inplace:
-            output_path = npz_path
-        else:
-            # Create backup with _with_bbox suffix
-            base_name = dataset_file.replace('.npz', '')
-            output_path = os.path.join(args.dataset_dir, f"{base_name}_with_bbox.npz")
+
+        # Determine output path — always _detect.npz, derived from base name
+        base_name = dataset_file.replace('_contact_lod1.npz', '').replace('_mhr.npz', '')
+        output_path = os.path.join(args.dataset_dir, f"{base_name}_detect.npz")
         
         # Process dataset
         process_dataset(

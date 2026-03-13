@@ -2,9 +2,9 @@
 PyTorch Dataset for DAMON with SMPL (6890-vertex) contact labels.
 
 Ground-truth contacts come from the original DECO/DAMON NPZ files which
-contain per-vertex binary labels in SMPL topology.  Bounding boxes are
-pulled from the corresponding MHR NPZ (same sample ordering) because the
-original SMPL NPZ does not include detected bounding boxes.
+contain per-vertex binary labels in SMPL topology.  Bounding boxes and
+camera intrinsics are loaded from the detect NPZ (imgname + bbox + cam_k)
+produced by damon_append.py.
 
 Interface is identical to DamonMHRDataset so the two can be swapped in
 evaluate.py / inference_demo.py without changing training or collation code.
@@ -30,9 +30,9 @@ class DamonSMPLDataset(Dataset):
             - 'imgname':       [N] image filenames
             - 'contact_label': [N, 6890] float contact labels (binarised at 0.5)
             - 'cam_k':         [N, 3, 3] camera intrinsics (optional)
-        mhr_npz_path:  Path to the corresponding converted MHR NPZ.
-            Used only to load bounding boxes (key 'bbox' [N, 4]).
-            If None, bbox falls back to full-image dimensions.
+        detect_npz_path: Path to the detect NPZ (imgname + bbox + cam_k).
+            Produced by damon_append.py.  If None, bbox falls back to
+            full-image dimensions and cam_k to default focal length.
         data_root: Root directory for images.  If None, tries:
             1. DAMON_DATA_ROOT environment variable
             2. /data3/rikhat.akizhanov/DECO  (hard-coded fallback)
@@ -50,7 +50,7 @@ class DamonSMPLDataset(Dataset):
     def __init__(
         self,
         smpl_npz_path: str,
-        mhr_npz_path: Optional[str] = None,
+        detect_npz_path: Optional[str] = None,
         data_root: Optional[str] = None,
     ):
         super().__init__()
@@ -70,30 +70,24 @@ class DamonSMPLDataset(Dataset):
             f"got {self.contact_labels.shape}"
         )
 
-        # Camera intrinsics from SMPL NPZ
-        cam_k_raw = smpl_data.get("cam_k", None)
-        if cam_k_raw is not None and cam_k_raw.shape == (num_samples, 3, 3):
-            self.cam_ks    = cam_k_raw.astype(np.float32)
-            self.has_cam_ks = True
-            print("  Camera intrinsics available")
-        else:
-            self.cam_ks    = None
-            self.has_cam_ks = False
-            print("  No camera intrinsics — will use default focal length")
-
-        # Bounding boxes from MHR NPZ
-        if mhr_npz_path is not None:
-            print(f"  Loading bounding boxes from {mhr_npz_path}")
-            mhr_data = np.load(mhr_npz_path, allow_pickle=True)
-            self.bboxes    = mhr_data["bbox"].astype(np.float32)  # [N, 4]
-            self.has_bboxes = True
+        # Camera intrinsics and bboxes from detect NPZ
+        if detect_npz_path is not None:
+            print(f"  Loading bbox and cam_k from {detect_npz_path}")
+            detect_data = np.load(detect_npz_path, allow_pickle=True)
+            self.bboxes  = detect_data["bbox"].astype(np.float32)   # [N, 4]
+            self.cam_ks  = detect_data["cam_k"].astype(np.float32)  # [N, 3, 3]
             assert len(self.bboxes) == num_samples, (
-                f"MHR NPZ has {len(self.bboxes)} samples but SMPL NPZ has {num_samples}"
+                f"detect NPZ has {len(self.bboxes)} samples but SMPL NPZ has {num_samples}"
             )
+            self.has_bboxes = True
+            self.has_cam_ks = True
+            print("  Bounding boxes and camera intrinsics available")
         else:
-            self.bboxes    = None
+            self.bboxes = None
+            self.cam_ks = None
             self.has_bboxes = False
-            print("  No MHR NPZ provided — bbox will be full-image dimensions")
+            self.has_cam_ks = False
+            print("  No detect NPZ — bbox will be full-image, cam_k will use default focal length")
 
         # Data root for image loading
         if data_root is None:
@@ -167,7 +161,7 @@ class DamonSMPLDataset(Dataset):
     def split_train_val(
         cls,
         smpl_npz_path: str,
-        mhr_npz_path: Optional[str] = None,
+        detect_npz_path: Optional[str] = None,
         val_ratio: float = 0.2,
         seed: int = 42,
         data_root: Optional[str] = None,
@@ -185,7 +179,7 @@ class DamonSMPLDataset(Dataset):
 
         full_dataset = cls(
             smpl_npz_path=smpl_npz_path,
-            mhr_npz_path=mhr_npz_path,
+            detect_npz_path=detect_npz_path,
             data_root=data_root,
         )
         n = len(full_dataset)

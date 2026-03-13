@@ -9,10 +9,17 @@ MHR LOD via --target_lod (default: 1).
 Conversion chain:
   SMPL (6890) → MHR LOD1 (18439) [→ MHR LOD_N if target_lod != 1]
 
+Output: a contact-only NPZ file with keys: imgname, contact_label.
+The LOD level is embedded in the output filename, e.g.:
+  hot_dca_trainval_contact_lod1.npz
+
+This file can be paired with a separate detect NPZ (bbox + cam_k) produced by
+damon_append.py, allowing each to be regenerated independently.
+
 Usage:
-  python mhr_smpl_conversion/convert_damon.py \\
+  python dataset/convert_damon.py \\
     --input_path /path/to/hot_dca_trainval.npz \\
-    --output_path /path/to/hot_dca_trainval_mhr.npz \\
+    --output_path /path/to/hot_dca_trainval_contact_lod1.npz \\
     --smpl_model_path /path/to/SMPL_NEUTRAL.npz \\
     --target_lod 1 \\
     --device cuda
@@ -73,17 +80,14 @@ def convert_dataset(
 
     imgnames = data["imgname"]
     contact_labels_smpl = data["contact_label"]
-    contact_labels_objectwise_smpl = data["contact_label_objectwise"]
 
     num_samples = len(imgnames)
     n_target_verts = BodyConverter.LOD_VERTEX_COUNTS[target_lod]
     print(f"Processing {num_samples} samples  |  target: MHR LOD{target_lod} ({n_target_verts} verts)")
 
     contact_labels_mhr = []
-    contact_labels_objectwise_mhr = []
 
     for i in tqdm(range(num_samples), desc="Converting"):
-        # --- overall contact label -------------------------------------------
         smpl_contact = torch.from_numpy(
             contact_labels_smpl[i].astype(np.float32)
         ).to(device)
@@ -94,27 +98,7 @@ def convert_dataset(
         )
         contact_labels_mhr.append(result.contacts.cpu().numpy())
 
-        # --- objectwise contact labels ----------------------------------------
-        objectwise_smpl: dict = contact_labels_objectwise_smpl[i]
-        objectwise_mhr: dict = {}
-
-        for obj_name, smpl_vertex_indices in objectwise_smpl.items():
-            # Sparse indices → binary [6890]
-            binary = np.zeros(6890, dtype=np.float32)
-            binary[smpl_vertex_indices] = 1.0
-
-            res = converter.smpl_to_mhr(
-                contacts=torch.from_numpy(binary).to(device),
-                target_lod=target_lod,
-            )
-            mhr_contacts = res.contacts  # long [V_tgt]
-            mhr_indices = torch.where(mhr_contacts > 0)[0].cpu().numpy()
-            objectwise_mhr[obj_name] = mhr_indices
-
-        contact_labels_objectwise_mhr.append(objectwise_mhr)
-
     contact_labels_mhr_stacked = np.stack(contact_labels_mhr, axis=0)
-    contact_labels_objectwise_arr = np.array(contact_labels_objectwise_mhr, dtype=object)
 
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     print(f"Saving converted dataset to: {output_path}")
@@ -122,12 +106,11 @@ def convert_dataset(
         output_path,
         imgname=imgnames,
         contact_label=contact_labels_mhr_stacked,
-        contact_label_objectwise=contact_labels_objectwise_arr,
     )
 
     print(f"Done. {num_samples} samples converted.")
     print(f"  SMPL vertices: 6890  →  MHR LOD{target_lod} vertices: {n_target_verts}")
-    print(f"  Output keys: imgname, contact_label, contact_label_objectwise")
+    print(f"  Output keys: imgname, contact_label")
 
 
 def main() -> None:

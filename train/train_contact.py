@@ -23,6 +23,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
+from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.utils.config import get_config
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -42,7 +43,7 @@ def damon_collate(batch):
         images    — list of B numpy arrays
         bboxes    — tensor [B, 4]
         cam_ks    — tensor [B, 3, 3]
-        contact_labels — tensor [B, 18439]
+        contact_labels — tensor [B, num_vertices]
     """
     images, bboxes, cam_ks, contact_labels = [], [], [], []
     for (img, bbox, cam_k), lbl in batch:
@@ -94,6 +95,40 @@ class ContactTrainer:
             mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
 
+        # ---- Reinitialize all contact modules from train config ----
+        # load_sam_3d_body reads the checkpoint's model_config.yaml, which may have
+        # different (or commented-out) CONTACT_HEAD settings. We always reinitialize
+        # contact_embedding and head_contact from train/config.yaml so that the
+        # architecture matches regardless of what the checkpoint config says.
+        import torch.nn as nn
+        train_contact_cfg = self.cfg.MODEL.CONTACT_HEAD
+        train_num_vertices = train_contact_cfg.get('NUM_VERTICES', 18439)
+        num_kp  = train_contact_cfg.get('NUM_CONTACTS', 21)
+        num_gbl = train_contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
+        total   = num_kp + num_gbl
+        dim     = self.model_cfg.MODEL.DECODER.DIM
+
+        old_tokens = getattr(self.model, 'total_contact_tokens', None)
+        old_verts  = getattr(self.model.head_contact, 'num_vertices', None) if hasattr(self.model, 'head_contact') else None
+
+        print(f"Reinitializing contact modules from train config: "
+              f"tokens {old_tokens}→{total}, verts {old_verts}→{train_num_vertices}")
+
+        self.model.num_contact_tokens        = num_kp
+        self.model.num_global_contact_tokens = num_gbl
+        self.model.total_contact_tokens      = total
+        self.model.contact_keypoint_indices  = list(range(num_kp))
+        self.model.contact_grid_size         = train_contact_cfg.get('GRID_SIZE', 1)
+        self.model.contact_grid_radius       = train_contact_cfg.get('GRID_RADIUS', 0.1)
+        self.model.contact_embedding         = nn.Embedding(total, dim).to(device)
+        self.model.head_contact              = ContactHead(
+            input_dim=dim,
+            num_contact_tokens=total,
+            num_vertices=train_num_vertices,
+            mlp_depth=train_contact_cfg.get('MLP_DEPTH', 2),
+            mlp_channel_div_factor=train_contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+        ).to(device)
+
         # ---- Freeze all params; unfreeze contact-related ones ----
         print("Freezing all parameters except contact head & tokens...")
         for param in self.model.parameters():
@@ -118,11 +153,16 @@ class ContactTrainer:
 
         # ---- Datasets ----
         print("Loading datasets...")
-        data_root = self.cfg.DATASET.get('DATA_ROOT', None)
-        val_ratio = self.cfg.DATASET.get('VAL_RATIO', 0.2)
-        seed      = self.cfg.DATASET.get('SEED', 42)
+        data_root  = self.cfg.DATASET.get('DATA_ROOT', None)
+        val_ratio  = self.cfg.DATASET.get('VAL_RATIO', 0.2)
+        seed       = self.cfg.DATASET.get('SEED', 42)
+        lod        = self.cfg.DATASET.get('LOD', 1)
+        contact_npz = self.cfg.DATASET.CONTACT_NPZ
+        detect_npz  = self.cfg.DATASET.get('DETECT_NPZ', {})
         self.train_dataset, self.val_dataset = DamonMHRDataset.split_train_val(
-            npz_path=self.cfg.DATASET.TRAINVAL_NPZ,
+            contact_npz_path=contact_npz.TRAINVAL,
+            detect_npz_path=detect_npz.get('TRAINVAL', None),
+            lod=lod,
             val_ratio=val_ratio,
             seed=seed,
             data_root=data_root,
@@ -305,7 +345,7 @@ class ContactTrainer:
                     "No contact output — ensure DO_CONTACT_TOKENS: true in config."
                 )
 
-            logits = output["contact"]["contact_logits"]  # [B, 18439]
+            logits = output["contact"]["contact_logits"]  # [B, num_vertices]
             loss = self._compute_loss(logits, contact_labels)
 
             self.optimizer.zero_grad()

@@ -36,6 +36,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
+from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
 from damon_smpl import DamonSMPLDataset
@@ -63,18 +64,44 @@ class ContactEvaluator:
 
         # Load model
         print("Loading SAM-3D-Body model...")
-        self.model, _ = load_sam_3d_body(
+        self.model, self.model_cfg = load_sam_3d_body(
             checkpoint_path=self.cfg.MODEL.CHECKPOINT_PATH,
             device=device,
             mhr_path=self.cfg.MODEL.MHR_MODEL_PATH,
         )
 
-        # Load checkpoint
+        # Reinitialize contact modules from train config (checkpoint model_config.yaml
+        # may have different / commented-out CONTACT_HEAD settings).
+        import torch.nn as nn
+        contact_cfg = self.cfg.MODEL.CONTACT_HEAD
+        num_vertices = contact_cfg.get('NUM_VERTICES', 18439)
+        num_kp  = contact_cfg.get('NUM_CONTACTS', 21)
+        num_gbl = contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
+        total   = num_kp + num_gbl
+        dim     = self.model_cfg.MODEL.DECODER.DIM
+        self.model.num_contact_tokens        = num_kp
+        self.model.num_global_contact_tokens = num_gbl
+        self.model.total_contact_tokens      = total
+        self.model.contact_keypoint_indices  = list(range(num_kp))
+        self.model.contact_grid_size         = contact_cfg.get('GRID_SIZE', 1)
+        self.model.contact_grid_radius       = contact_cfg.get('GRID_RADIUS', 0.1)
+        self.model.contact_embedding         = nn.Embedding(total, dim).to(device)
+        self.model.head_contact              = ContactHead(
+            input_dim=dim,
+            num_contact_tokens=total,
+            num_vertices=num_vertices,
+            mlp_depth=contact_cfg.get('MLP_DEPTH', 2),
+            mlp_channel_div_factor=contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+        ).to(device)
+
+        # Load trained checkpoint (contact head weights override the fresh init above)
         print(f"Loading checkpoint: {checkpoint_path}")
         ckpt = torch.load(checkpoint_path, map_location=device)
         state = ckpt.get('model_state_dict', ckpt)
         self.model.load_state_dict(state, strict=False)
         self.model.eval()
+
+        self.lod = self.cfg.DATASET.get('LOD', 1)
 
         # Contact converter (SMPL mode only — fast, CPU is fine)
         if self.mode == "smpl":
@@ -97,19 +124,21 @@ class ContactEvaluator:
         val_ratio = self.cfg.DATASET.get('VAL_RATIO', 0.2)
         seed      = self.cfg.DATASET.get('SEED', 42)
 
+        lod         = self.cfg.DATASET.get('LOD', 1)
+        contact_npz = self.cfg.DATASET.CONTACT_NPZ
+        detect_npz  = self.cfg.DATASET.get('DETECT_NPZ', {})
+
         if self.mode == "smpl":
             # Load GT contacts from original DECO SMPL NPZ
             smpl_trainval = self.cfg.DATASET.get('SMPL_TRAINVAL_NPZ', None)
             smpl_test     = self.cfg.DATASET.get('SMPL_TEST_NPZ', None)
-            mhr_trainval  = self.cfg.DATASET.get('TRAINVAL_NPZ', None)
-            mhr_test      = self.cfg.DATASET.get('TEST_NPZ', None)
 
             if self.split == 'test':
                 if not smpl_test:
                     raise ValueError("DATASET.SMPL_TEST_NPZ not set in config.")
                 dataset = DamonSMPLDataset(
                     smpl_npz_path=smpl_test,
-                    mhr_npz_path=mhr_test,
+                    detect_npz_path=detect_npz.get('TEST', None),
                     data_root=data_root,
                 )
             else:
@@ -117,23 +146,29 @@ class ContactEvaluator:
                     raise ValueError("DATASET.SMPL_TRAINVAL_NPZ not set in config.")
                 train_ds, val_ds = DamonSMPLDataset.split_train_val(
                     smpl_npz_path=smpl_trainval,
-                    mhr_npz_path=mhr_trainval,
+                    detect_npz_path=detect_npz.get('TRAINVAL', None),
                     val_ratio=val_ratio,
                     seed=seed,
                     data_root=data_root,
                 )
                 dataset = train_ds if self.split == 'train' else val_ds
         else:
-            # MHR mode — original behaviour
+            # MHR mode
             if self.split == 'test':
-                test_npz = self.cfg.DATASET.get('TEST_NPZ', None)
-                if not test_npz:
-                    raise ValueError("DATASET.TEST_NPZ not set in config.")
-                dataset = DamonMHRDataset(npz_path=test_npz, data_root=data_root)
+                if not contact_npz.get('TEST', None):
+                    raise ValueError("DATASET.CONTACT_NPZ.TEST not set in config.")
+                dataset = DamonMHRDataset(
+                    contact_npz_path=contact_npz.TEST,
+                    detect_npz_path=detect_npz.get('TEST', None),
+                    lod=lod,
+                    data_root=data_root,
+                )
             else:
                 # Reproduce the exact same train/val split used during training.
                 train_ds, val_ds = DamonMHRDataset.split_train_val(
-                    npz_path=self.cfg.DATASET.TRAINVAL_NPZ,
+                    contact_npz_path=contact_npz.TRAINVAL,
+                    detect_npz_path=detect_npz.get('TRAINVAL', None),
+                    lod=lod,
                     val_ratio=val_ratio,
                     seed=seed,
                     data_root=data_root,
@@ -164,7 +199,7 @@ class ContactEvaluator:
 
     @torch.no_grad()
     def evaluate(self, threshold: float = 0.5):
-        all_probs = []   # [N, V_mhr=18439]
+        all_probs = []   # [N, V_lod]
         all_gt = []      # [N, V_mhr or V_smpl]
 
         for images, bboxes, cam_ks, contact_labels in tqdm(self.loader, desc="Evaluating"):
@@ -177,23 +212,24 @@ class ContactEvaluator:
             all_probs.append(probs.numpy())
             all_gt.append(contact_labels.numpy())
 
-        all_probs = np.concatenate(all_probs, axis=0)            # [N, 18439]
-        all_gt    = np.concatenate(all_gt, axis=0).astype(bool)  # [N, V]
+        all_probs = np.concatenate(all_probs, axis=0)            # [N, V_lod]
+        all_gt    = np.concatenate(all_gt, axis=0).astype(bool)  # [N, V_smpl or V_lod]
 
         if self.mode == "smpl":
-            # Interpolate continuous MHR probs → SMPL space, then threshold once.
-            # We use the raw _interpolate() path so we get float values for ROC/plots.
-            print("Converting MHR predictions to SMPL space...")
-            smpl_probs = self._interpolate_probs_to_smpl(all_probs)  # [N, 6890] float
-            all_preds  = smpl_probs > threshold                       # [N, 6890] bool
-            metrics = self._print_metrics(all_preds, all_gt, smpl_probs, threshold)
+            # Convert LOD_N predictions → SMPL space.
+            # For LOD1: direct barycentric interpolation (exact).
+            # For LOD_N (N≠1): Voronoi BFS upsample LOD_N → LOD1, then LOD1 → SMPL.
+            print(f"Converting LOD{self.lod} predictions to SMPL space...")
+            smpl_probs = self._interpolate_probs_to_smpl(all_probs)  # [N, 6890]
+            all_preds  = smpl_probs > threshold
+            metrics    = self._print_metrics(all_preds, all_gt, smpl_probs, threshold)
             self._plot_iou_histogram(all_preds, all_gt)
             self._plot_prob_distribution(smpl_probs, all_gt)
-            roc_auc = self._plot_roc_curve(smpl_probs, all_gt)
+            roc_auc    = self._plot_roc_curve(smpl_probs, all_gt)
             self._save_results(metrics, roc_auc, threshold)
             return smpl_probs, all_preds, all_gt
         else:
-            all_preds = all_probs > threshold    # [N, 18439]
+            all_preds = all_probs > threshold    # [N, V_lod]
             metrics = self._print_metrics(all_preds, all_gt, all_probs, threshold)
             self._plot_iou_histogram(all_preds, all_gt)
             self._plot_prob_distribution(all_probs, all_gt)
@@ -201,21 +237,38 @@ class ContactEvaluator:
             self._save_results(metrics, roc_auc, threshold)
             return all_probs, all_preds, all_gt
 
+    def _smpl_gt_to_lod(self, smpl_gt: np.ndarray) -> np.ndarray:
+        """
+        Convert SMPL GT labels [N, 6890] → LOD_N [N, V_lod] binary.
+
+        Uses the same smpl_to_mhr forward chain as convert_damon.py, so the
+        result is consistent with how the training labels were generated.
+        Requires SMPL face connectivity (loaded from SMPL_MODEL_PATH).
+        """
+        smpl_model_path = self.cfg.MODEL.get('SMPL_MODEL_PATH', None)
+        if smpl_model_path is None:
+            raise ValueError(
+                "MODEL.SMPL_MODEL_PATH must be set in config to convert SMPL GT to LOD."
+            )
+        smpl_npz   = np.load(smpl_model_path, allow_pickle=True)
+        smpl_faces = smpl_npz['f'].astype(np.int32)
+        conv = BodyConverter(smpl_faces=smpl_faces, device='cpu')
+
+        gt_t = torch.from_numpy(smpl_gt.astype(np.float32))  # [N, 6890]
+        result = conv.smpl_to_mhr(contacts=gt_t, target_lod=self.lod, threshold=0.5)
+        return result.contacts.numpy().astype(bool)            # [N, V_lod]
+
     def _interpolate_probs_to_smpl(self, mhr_probs: np.ndarray) -> np.ndarray:
         """
-        Interpolate continuous MHR probabilities [N, 18439] → SMPL [N, 6890].
+        Convert MHR LOD_N probabilities [N, V_N] → SMPL [N, 6890] as floats.
 
-        Uses the raw _interpolate() path so we get float values (not yet
-        thresholded) suitable for ROC and probability-distribution plots.
+        For LOD1: direct barycentric interpolation LOD1 → SMPL.
+        For other LODs: scatter LOD_N → LOD1 first, then interpolate to SMPL.
+        Preserves float values (no thresholding) for ROC / prob-distribution plots.
         """
-        probs_t = torch.from_numpy(mhr_probs)  # [N, 18439] float32
-        interp = self.converter._interpolate(
-            probs_t,
-            self.converter._m2s_tri_ids,
-            self.converter._m2s_baryc,
-            self.converter._mhr_faces,
-        )
-        return interp.numpy()  # [N, 6890]
+        probs_t = torch.from_numpy(mhr_probs.astype(np.float32))
+        smpl_probs = self.converter.mhr_lod_probs_to_smpl_probs(probs_t, source_lod=self.lod)
+        return smpl_probs.numpy()
 
     # ------------------------------------------------------------------
     # Metric reporting
@@ -259,17 +312,21 @@ class ContactEvaluator:
         # ------------------------------------------------------------------
         geo_results = {}
         if self.mode == "smpl":
+            # Geodesic distance only available when evaluating in SMPL (6890) space.
             fp_geo, fn_geo = self._compute_geo_distance(preds, gt, threshold)
             geo_results = {"fp_geo": fp_geo, "fn_geo": fn_geo}
         else:
-            print("WARNING: Geodesic distance metric not supported for MHR topology "
-                  "(no precomputed distance matrix available).")
+            print("  (Geodesic distance skipped — not in SMPL evaluation space)")
 
         # ------------------------------------------------------------------
         # Print
         # ------------------------------------------------------------------
+        mode_label = (
+            f"smpl→lod{self.lod}" if self.mode == "_lod_from_smpl"
+            else self.mode
+        )
         print("\n" + "=" * 70)
-        print(f"EVALUATION RESULTS  [{self.split}]  (mode={self.mode})")
+        print(f"EVALUATION RESULTS  [{self.split}]  (mode={mode_label}, lod={self.lod})")
         print("=" * 70)
         print(f"  --- Per-sample averaged (matches InteractVLM) ---")
         print(f"  F1        : {mean_f1:.4f}")
@@ -467,7 +524,7 @@ def main():
     parser.add_argument("--mode", type=str, default="smpl",
                         choices=["smpl", "mhr"],
                         help="Mesh topology for metrics: 'smpl' (6890 verts, default) "
-                             "or 'mhr' (18439 verts)")
+                             "or 'mhr' (LOD vertex count from config)")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 

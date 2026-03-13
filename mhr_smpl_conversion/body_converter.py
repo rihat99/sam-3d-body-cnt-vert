@@ -132,6 +132,11 @@ class BodyConverter:
         # Keyed by target LOD int; each value is (tri_ids, baryc_coords)
         self._lod_mappings: dict[int, tuple[Tensor, Tensor]] = {}
 
+        # ── Voronoi cache (LOD_N → LOD1 vertex assignment) ───────────────
+        # Keyed by source LOD int; value is [18439] long tensor mapping
+        # each LOD1 vertex to its nearest LOD_N vertex index.
+        self._voronoi_cache: dict[int, Tensor] = {}
+
     # ------------------------------------------------------------------
     # Public API — SMPL ↔ MHR
     # ------------------------------------------------------------------
@@ -308,6 +313,170 @@ class BodyConverter:
         """Apply LOD1 → target_lod mapping to contact values [B, 18439] → [B, V_tgt]."""
         tri_ids, baryc = self._get_lod_mapping(target_lod)
         return self._interpolate(cont_lod1, tri_ids, baryc, self._mhr_faces)
+
+    # ------------------------------------------------------------------
+    # LOD_N → LOD1 via Voronoi BFS
+    # ------------------------------------------------------------------
+
+    def _build_voronoi_lod1(self, source_lod: int) -> Tensor:
+        """
+        Precompute a [18439] mapping: LOD1 vertex → nearest LOD_N vertex index.
+
+        Each of the V_N LOD_N vertices sits inside one LOD1 source triangle
+        (given by tri_ids from the lod1→lodN mapping).  We treat these as BFS
+        seeds on the LOD1 triangle-adjacency graph: every LOD1 triangle is
+        assigned to the nearest seed's LOD_N vertex.  Each LOD1 vertex then takes
+        the assignment of the first triangle that covers it during BFS.
+
+        This gives a Voronoi partition: ~31 LOD1 vertices per LOD6 vertex on
+        average, covering all 18439 LOD1 vertices (vs. only 1783 with scatter).
+
+        Result is cached in self._voronoi_cache[source_lod].
+        """
+        from collections import deque
+
+        tri_ids_np = self._get_lod_mapping(source_lod)[0].cpu().numpy()  # [V_N]
+        faces_np   = self._mhr_faces.cpu().numpy()                         # [F, 3]
+        F          = len(faces_np)
+        n_lod1     = self.LOD_VERTEX_COUNTS[1]
+
+        # ── triangle adjacency (shared edge → neighbour) ──────────────────
+        edges      = np.concatenate([faces_np[:, [0, 1]],
+                                     faces_np[:, [1, 2]],
+                                     faces_np[:, [2, 0]]], axis=0)  # [3F, 2]
+        face_of    = np.tile(np.arange(F), 3)
+        edge_key   = np.sort(edges, axis=1)
+        order      = np.lexsort(edge_key[:, ::-1].T)
+        ek, fo     = edge_key[order], face_of[order]
+        equal      = (ek[:-1] == ek[1:]).all(axis=1)
+        f1, f2     = fo[:-1][equal], fo[1:][equal]
+
+        tri_adj: list[list[int]] = [[] for _ in range(F)]
+        for a, b in zip(f1.tolist(), f2.tolist()):
+            tri_adj[a].append(b)
+            tri_adj[b].append(a)
+
+        # ── BFS from seed triangles ───────────────────────────────────────
+        tri_owner  = np.full(F, -1, dtype=np.int32)
+        queue: deque[int] = deque()
+        for lod_v, t in enumerate(tri_ids_np.tolist()):
+            if tri_owner[t] < 0:
+                tri_owner[t] = lod_v
+                queue.append(t)
+
+        while queue:
+            t     = queue.popleft()
+            owner = tri_owner[t]
+            for nb in tri_adj[t]:
+                if tri_owner[nb] < 0:
+                    tri_owner[nb] = owner
+                    queue.append(nb)
+
+        # ── assign each LOD1 vertex to its nearest LOD_N anchor ──────────
+        # Each LOD1 vertex appears in multiple triangles; first BFS assignment wins.
+        vert_owner = np.full(n_lod1, -1, dtype=np.int64)
+        for t in range(F):
+            owner = tri_owner[t]
+            if owner < 0:
+                continue
+            for v in faces_np[t]:
+                if vert_owner[v] < 0:
+                    vert_owner[v] = owner
+
+        vert_owner[vert_owner < 0] = 0  # safety fallback (shouldn't happen)
+
+        result = torch.from_numpy(vert_owner).long().to(self._device)
+        self._voronoi_cache[source_lod] = result
+        return result
+
+    def lod_probs_to_lod1_probs(
+        self,
+        probs: Tensor | np.ndarray,
+        source_lod: int,
+    ) -> Tensor:
+        """
+        Upsample LOD_N float probs [B, V_N] → LOD1 [B, 18439] via Voronoi BFS.
+
+        Each LOD1 vertex is assigned to its nearest LOD_N anchor (BFS on the
+        LOD1 triangle-adjacency graph seeded by the V_N source triangles).
+        The Voronoi map is computed once per LOD level and cached.
+
+        LOD1[v] = LOD_N[nearest_lod_n_anchor[v]]
+
+        Compared to scatter (which covered only 1783/18439 LOD1 vertices for LOD6),
+        this covers all 18439 vertices and correctly expands each LOD_N contact
+        region to the full Voronoi cell.
+
+        If source_lod == 1 the input is returned unchanged (identity).
+        """
+        if source_lod == 1:
+            t, was_single = self._to_tensor_batched(probs, ndim=2)
+            return t.squeeze(0) if was_single else t
+
+        cont_t, was_single = self._to_tensor_batched(probs, ndim=2)
+        cont_t = cont_t.to(self._device)
+
+        if source_lod not in self._voronoi_cache:
+            print(f"  Building LOD{source_lod}→LOD1 Voronoi map (one-time, ~2 s)...")
+            self._build_voronoi_lod1(source_lod)
+
+        vert_owner = self._voronoi_cache[source_lod]  # [18439] LOD1 → LOD_N idx
+        lod1_probs = cont_t[:, vert_owner]             # [B, 18439]
+
+        return lod1_probs.squeeze(0) if was_single else lod1_probs
+
+    def mhr_lod_probs_to_smpl_probs(
+        self,
+        probs: Tensor | np.ndarray,
+        source_lod: int = 1,
+    ) -> Tensor:
+        """
+        Convert MHR LOD_N float probs to SMPL float probs [*, 6890].
+
+        Chains: LOD_N → LOD1 (scatter) → SMPL (barycentric interpolation).
+        Preserves float values (no thresholding) so the output can be used for
+        ROC curves and probability-distribution plots.
+
+        Args:
+            probs:      [B, V_N] or [V_N]
+            source_lod: Source LOD (0–6).
+
+        Returns:
+            [B, 6890] or [6890] float tensor on self._device.
+        """
+        lod1_probs = self.lod_probs_to_lod1_probs(probs, source_lod)
+
+        cont_t, was_single = self._to_tensor_batched(lod1_probs, ndim=2)
+        smpl_probs = self._interpolate(
+            cont_t, self._m2s_tri_ids, self._m2s_baryc, self._mhr_faces
+        )
+        return smpl_probs.squeeze(0) if was_single else smpl_probs
+
+    def mhr_lod_to_smpl(
+        self,
+        contacts: Tensor | np.ndarray,
+        source_lod: int = 1,
+        threshold: Optional[float] = None,
+    ) -> ConversionOutput:
+        """
+        Convert MHR LOD_N binary contacts/probs to SMPL binary contacts.
+
+        For source_lod == 1 this is identical to mhr_to_smpl().
+        For other LODs: scatters LOD_N → LOD1 then interpolates LOD1 → SMPL.
+
+        Args:
+            contacts:   [B, V_N] or [V_N] — float probs or binary ints.
+            source_lod: Source LOD (0–6).
+            threshold:  Binarisation threshold (default: self._threshold).
+
+        Returns:
+            ConversionOutput with .contacts [B/·, 6890] long binary.
+        """
+        thr = threshold if threshold is not None else self._threshold
+        smpl_probs = self.mhr_lod_probs_to_smpl_probs(contacts, source_lod)
+        cont_t, was_single = self._to_tensor_batched(smpl_probs, ndim=2)
+        out = (cont_t > thr).long()
+        return ConversionOutput(contacts=out.squeeze(0) if was_single else out)
 
     # ------------------------------------------------------------------
     # Core interpolation

@@ -1,8 +1,9 @@
 """
 PyTorch Dataset for Damon with MHR contact labels.
 
-This dataset loads images and binary per-vertex contact labels (18439 vertices for MHR topology),
-along with bounding boxes and camera parameters.
+Loads from two separate NPZ files:
+  - contact NPZ:  imgname, contact_label  (LOD-specific)
+  - detect NPZ:   imgname, bbox, cam_k    (LOD-independent, optional)
 
 Train / val / test splits are handled by passing separate npz files.
 """
@@ -15,83 +16,113 @@ from PIL import Image
 from typing import Optional, Tuple
 
 
+# LOD → vertex count (mirrors BodyConverter.LOD_VERTEX_COUNTS)
+LOD_VERTEX_COUNTS = {
+    0: 73639,
+    1: 18439,
+    2: 10661,
+    3:  4899,
+    4:  2461,
+    5:   971,
+    6:   595,
+}
+
+
 class DamonMHRDataset(Dataset):
     """
     Dataset for Damon images with MHR contact labels, bounding boxes, and camera parameters.
 
     Args:
-        npz_path: Path to the .npz file containing the dataset.
+        contact_npz_path: Path to the contact .npz file.
+            Required keys:
+            - 'imgname':       Array of image filenames
+            - 'contact_label': Binary contact labels  (N, V)  where V = LOD vertex count
+        detect_npz_path: Path to the detect .npz file (optional).
             Expected keys:
-            - 'imgname':       Array of image filenames (e.g., 'datasets/HOT-Annotated/images/...')
-            - 'contact_label': Binary contact labels  (N, 18439)
-            - 'bbox':          Bounding boxes  (N, 4) in [x1, y1, x2, y2] — optional
-            - 'cam_k':         Camera intrinsics (N, 3, 3) — optional
+            - 'imgname': must match contact_npz imgnames
+            - 'bbox':    Bounding boxes (N, 4) in [x1, y1, x2, y2]
+            - 'cam_k':   Camera intrinsics (N, 3, 3)
+        lod: MHR Level of Detail (0–6, default 1 → 18439 verts).
         data_root: Root directory for images. If None, tries:
             1. DAMON_DATA_ROOT environment variable
-            2. Parent directory of npz_path
+            2. Parent directory of contact_npz_path
         transform: Optional transform applied to the PIL Image before returning.
 
     Returns per item:
-        (image, bbox, cam_k):
-            image  — numpy uint8 RGB array [H, W, 3]  (raw, SAM-3D-Body transforms applied later)
+        (image, bbox, cam_k), contact_label
+            image  — numpy uint8 RGB array [H, W, 3]
             bbox   — float32 tensor [4]  (x1, y1, x2, y2)
             cam_k  — float32 tensor [3, 3]
-        contact_label — int64 tensor [18439] (binary)
+        contact_label — int64 tensor [V] (binary)
     """
-
-    NUM_VERTICES = 18439
 
     def __init__(
         self,
-        npz_path: str,
+        contact_npz_path: str,
+        detect_npz_path: Optional[str] = None,
+        lod: int = 1,
         data_root: Optional[str] = None,
         transform=None,
     ):
         super().__init__()
 
-        self.npz_path = npz_path
+        if lod not in LOD_VERTEX_COUNTS:
+            raise ValueError(f"lod must be 0–6, got {lod}")
+
+        self.contact_npz_path = contact_npz_path
+        self.detect_npz_path = detect_npz_path
+        self.lod = lod
+        self.num_vertices = LOD_VERTEX_COUNTS[lod]
         self.transform = transform
 
-        print(f"Loading Damon MHR dataset from {npz_path}")
-        data = np.load(npz_path, allow_pickle=True)
+        # --- Load contact NPZ ---
+        print(f"Loading Damon MHR contact dataset from {contact_npz_path}")
+        contact_data = np.load(contact_npz_path, allow_pickle=True)
 
-        self.imgnames = data['imgname']
-        self.contact_labels = data['contact_label']  # (N, 18439)
-
-        self.bboxes = data.get('bbox', None)     # (N, 4)  optional
-        self.cam_ks = data.get('cam_k', None)    # (N, 3, 3)  optional
+        self.imgnames = contact_data['imgname']
+        self.contact_labels = contact_data['contact_label']  # (N, V)
 
         num_samples = len(self.imgnames)
-        assert self.contact_labels.shape == (num_samples, self.NUM_VERTICES), (
-            f"Expected contact_labels shape ({num_samples}, {self.NUM_VERTICES}), "
-            f"got {self.contact_labels.shape}"
+        assert self.contact_labels.shape == (num_samples, self.num_vertices), (
+            f"Expected contact_labels shape ({num_samples}, {self.num_vertices}) "
+            f"for LOD{lod}, got {self.contact_labels.shape}"
         )
 
-        if self.bboxes is not None:
+        # --- Load detect NPZ (optional) ---
+        if detect_npz_path is not None:
+            print(f"  Loading detect data from {detect_npz_path}")
+            detect_data = np.load(detect_npz_path, allow_pickle=True)
+
+            # Sanity check: imgnames must match
+            det_imgnames = detect_data['imgname']
+            assert len(det_imgnames) == num_samples and (det_imgnames == self.imgnames).all(), (
+                f"imgname mismatch between contact NPZ ({num_samples}) "
+                f"and detect NPZ ({len(det_imgnames)})"
+            )
+
+            self.bboxes = detect_data['bbox'].astype(np.float32)   # (N, 4)
+            self.cam_ks = detect_data['cam_k'].astype(np.float32)  # (N, 3, 3)
             assert self.bboxes.shape == (num_samples, 4), (
                 f"Expected bbox shape ({num_samples}, 4), got {self.bboxes.shape}"
             )
-            print(f"  Bounding boxes available")
-            self.has_bboxes = True
-        else:
-            print(f"  No bounding boxes — will use full image bbox")
-            self.has_bboxes = False
-
-        if self.cam_ks is not None:
             assert self.cam_ks.shape == (num_samples, 3, 3), (
                 f"Expected cam_k shape ({num_samples}, 3, 3), got {self.cam_ks.shape}"
             )
-            print(f"  Camera intrinsics available")
+            print(f"  Bounding boxes and camera intrinsics available")
+            self.has_bboxes = True
             self.has_cam_ks = True
         else:
-            print(f"  No camera intrinsics — will use default focal length")
+            self.bboxes = None
+            self.cam_ks = None
+            self.has_bboxes = False
             self.has_cam_ks = False
+            print(f"  No detect NPZ — will use full-image bbox and default focal length")
 
-        # Resolve data root
+        # --- Resolve data root ---
         if data_root is None:
             data_root = os.environ.get('DAMON_DATA_ROOT', None)
             if data_root is None:
-                data_root = os.path.dirname(os.path.dirname(npz_path))
+                data_root = os.path.dirname(os.path.dirname(contact_npz_path))
                 print(
                     f"Warning: data_root not specified. Using default: {data_root}\n"
                     f"Set DAMON_DATA_ROOT env var or pass data_root explicitly if images are missing."
@@ -101,7 +132,7 @@ class DamonMHRDataset(Dataset):
 
         total_contacts = int(self.contact_labels.sum())
         print(
-            f"Loaded {num_samples} samples | "
+            f"Loaded {num_samples} samples | LOD{lod} ({self.num_vertices} verts) | "
             f"total contact vertices: {total_contacts} | "
             f"avg per sample: {total_contacts / num_samples:.1f}"
         )
@@ -162,35 +193,41 @@ class DamonMHRDataset(Dataset):
         return (image, bbox, cam_k), contact_label
 
     # ------------------------------------------------------------------
-    # ------------------------------------------------------------------
     # Train / val splitting
     # ------------------------------------------------------------------
 
     @classmethod
     def split_train_val(
         cls,
-        npz_path: str,
+        contact_npz_path: str,
+        detect_npz_path: Optional[str] = None,
+        lod: int = 1,
         val_ratio: float = 0.2,
         seed: int = 42,
         data_root: Optional[str] = None,
     ):
         """
-        Load the full dataset from *npz_path* and split it into train and val
-        subsets using a fixed random seed.
+        Load the full dataset and split into train and val subsets.
 
         Args:
-            npz_path:  Path to the combined train+val npz file.
-            val_ratio: Fraction of samples to use for validation (default 0.2).
-            seed:      Random seed for reproducible shuffling (default 42).
-            data_root: Root directory for images.
+            contact_npz_path:  Path to the contact NPZ file.
+            detect_npz_path:   Path to the detect NPZ file (optional).
+            lod:               MHR LOD level (default 1).
+            val_ratio:         Fraction of samples to use for validation (default 0.2).
+            seed:              Random seed for reproducible shuffling (default 42).
+            data_root:         Root directory for images.
 
         Returns:
-            (train_subset, val_subset) — torch.utils.data.Subset objects that
-            wrap the same underlying DamonMHRDataset instance.
+            (train_subset, val_subset) — torch.utils.data.Subset objects.
         """
         from torch.utils.data import Subset
 
-        full_dataset = cls(npz_path=npz_path, data_root=data_root)
+        full_dataset = cls(
+            contact_npz_path=contact_npz_path,
+            detect_npz_path=detect_npz_path,
+            lod=lod,
+            data_root=data_root,
+        )
         n = len(full_dataset)
 
         rng = np.random.RandomState(seed)
@@ -216,7 +253,7 @@ class DamonMHRDataset(Dataset):
             'idx': idx,
             'imgname': self.imgnames[idx],
             'num_contacts': num_contacts,
-            'contact_ratio': num_contacts / self.NUM_VERTICES,
+            'contact_ratio': num_contacts / self.num_vertices,
         }
         if self.has_bboxes:
             bbox = self.bboxes[idx]
@@ -237,32 +274,42 @@ def build_datasets(cfg):
     """
     Build train, val, and test dataset objects from a config node.
 
-    Train and val come from the same combined npz file (TRAINVAL_NPZ); they
-    are split by index using a fixed random seed so the split is perfectly
-    reproducible across training and evaluation runs.
+    Train and val come from the same combined contact npz file (CONTACT_NPZ.TRAINVAL);
+    they are split by index using a fixed random seed.
 
     Expected config keys under cfg.DATASET:
-        TRAINVAL_NPZ  — path to the combined train+val npz file
-        TEST_NPZ      — path to the held-out test npz file (optional)
-        DATA_ROOT     — root directory for images (or use DAMON_DATA_ROOT env var)
-        VAL_RATIO     — fraction of samples used for val (default 0.2)
-        SEED          — random seed for reproducible split (default 42)
+        CONTACT_NPZ.TRAINVAL  — path to the contact npz for train+val
+        CONTACT_NPZ.TEST      — path to the contact npz for test (optional)
+        DETECT_NPZ.TRAINVAL   — path to the detect npz for train+val (optional)
+        DETECT_NPZ.TEST       — path to the detect npz for test (optional)
+        LOD                   — MHR LOD level (default 1)
+        DATA_ROOT             — root directory for images (or use DAMON_DATA_ROOT env var)
+        VAL_RATIO             — fraction of samples used for val (default 0.2)
+        SEED                  — random seed for reproducible split (default 42)
     """
     data_root = cfg.DATASET.get('DATA_ROOT', None)
     val_ratio = cfg.DATASET.get('VAL_RATIO', 0.2)
     seed      = cfg.DATASET.get('SEED', 42)
+    lod       = cfg.DATASET.get('LOD', 1)
+
+    contact_npz = cfg.DATASET.CONTACT_NPZ
+    detect_npz  = cfg.DATASET.get('DETECT_NPZ', {})
 
     train_ds, val_ds = DamonMHRDataset.split_train_val(
-        npz_path=cfg.DATASET.TRAINVAL_NPZ,
+        contact_npz_path=contact_npz.TRAINVAL,
+        detect_npz_path=detect_npz.get('TRAINVAL', None),
+        lod=lod,
         val_ratio=val_ratio,
         seed=seed,
         data_root=data_root,
     )
 
     test_ds = None
-    if cfg.DATASET.get('TEST_NPZ', None):
+    if contact_npz.get('TEST', None):
         test_ds = DamonMHRDataset(
-            npz_path=cfg.DATASET.TEST_NPZ,
+            contact_npz_path=contact_npz.TEST,
+            detect_npz_path=detect_npz.get('TEST', None),
+            lod=lod,
             data_root=data_root,
         )
 
@@ -277,7 +324,11 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Test Damon MHR Dataset")
-    parser.add_argument("--npz_path", type=str, required=True, help="Path to the .npz file")
+    parser.add_argument("--contact_npz_path", type=str, required=True,
+                        help="Path to the contact .npz file")
+    parser.add_argument("--detect_npz_path", type=str, default=None,
+                        help="Path to the detect .npz file (optional)")
+    parser.add_argument("--lod", type=int, default=1, help="MHR LOD level (default 1)")
     parser.add_argument("--data_root", type=str, default=None,
                         help="Root directory for images")
     parser.add_argument("--num_samples", type=int, default=3)
@@ -287,7 +338,12 @@ if __name__ == "__main__":
     print("Testing Damon MHR Dataset")
     print("=" * 80)
 
-    dataset = DamonMHRDataset(npz_path=args.npz_path, data_root=args.data_root)
+    dataset = DamonMHRDataset(
+        contact_npz_path=args.contact_npz_path,
+        detect_npz_path=args.detect_npz_path,
+        lod=args.lod,
+        data_root=args.data_root,
+    )
     print(f"\nDataset length: {len(dataset)}")
 
     for i in range(min(args.num_samples, len(dataset))):

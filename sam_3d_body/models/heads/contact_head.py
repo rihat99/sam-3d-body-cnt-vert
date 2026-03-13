@@ -72,10 +72,7 @@ class ContactHead(nn.Module):
         Returns:
             contact_logits: [B, num_vertices]  (un-sigmoid-ed)
         """
-        batch_size, num_tokens, C = x.shape
-        assert num_tokens == self.num_contact_tokens, (
-            f"Expected {self.num_contact_tokens} contact tokens, got {num_tokens}"
-        )
+        batch_size = x.shape[0]
 
         # Attention-weighted pool: [B, 1, C] x [B, num_tokens, C] -> [B, 1, C]
         query = self.pool_query.expand(batch_size, -1, -1)

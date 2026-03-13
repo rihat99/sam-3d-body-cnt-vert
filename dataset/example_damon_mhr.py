@@ -27,7 +27,9 @@ def main():
     # Create dataset
     print("\nCreating dataset...")
     dataset = DamonMHRDataset(
-        npz_path='../../datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz',
+        contact_npz_path='../../datasets/daimon_mhr_contact/hot_dca_trainval_contact_lod1.npz',
+        detect_npz_path='../../datasets/daimon_mhr_contact/hot_dca_trainval_detect.npz',
+        lod=1,
         data_root='/media/rikhat/Hard/datasets/DECO/',
         transform=transform
     )

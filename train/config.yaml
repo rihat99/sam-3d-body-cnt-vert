@@ -30,7 +30,8 @@ MODEL:
     # Extra global token(s) not updated with image features (0 = off)
     NUM_GLOBAL_TOKENS: 1
     # 18439 MHR mesh vertices
-    NUM_VERTICES: 18439
+    # NUM_VERTICES: 18439
+    NUM_VERTICES: 595
     MLP_DEPTH: 2
     MLP_CHANNEL_DIV_FACTOR: 1
     # K×K grid sampling around each keypoint (1 = original single-point)
@@ -76,10 +77,16 @@ TRAIN:
   VAL_FREQ: 1
   RESUME: null
 DATASET:
-  # Combined train+val npz — split by index with VAL_RATIO / SEED.
-  TRAINVAL_NPZ: /home/rikhat/human_global_motion/datasets/daimon_mhr_contact/hot_dca_trainval_mhr.npz
-  # Held-out test set (separate npz file).
-  TEST_NPZ: /home/rikhat/human_global_motion/datasets/daimon_mhr_contact/hot_dca_test_mhr.npz
+  # MHR LOD level (0–6). Determines vertex count for contact labels.
+  LOD: 6
+  # Contact NPZ files (imgname + contact_label); LOD-specific.
+  CONTACT_NPZ:
+    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_contact_lod6.npz
+    TEST: ./dataset/damon_mhr_contact/hot_dca_test_contact_lod6.npz
+  # Detect NPZ files (imgname + bbox + cam_k); LOD-independent.
+  DETECT_NPZ:
+    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_detect.npz
+    TEST: ./dataset/damon_mhr_contact/hot_dca_test_detect.npz
   # Original DECO NPZs with SMPL (6890-vertex) contact labels — used for SMPL-space evaluation.
   SMPL_TRAINVAL_NPZ: /media/rikhat/Hard/datasets/DECO/datasets/Release_Datasets/damon/hot_dca_trainval.npz
   SMPL_TEST_NPZ: /media/rikhat/Hard/datasets/DECO/datasets/Release_Datasets/damon/hot_dca_test.npz

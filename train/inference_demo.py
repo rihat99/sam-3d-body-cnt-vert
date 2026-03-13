@@ -41,8 +41,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 os.environ["MOMENTUM_ENABLED"] = "1"
 
 from sam_3d_body.build_models import load_sam_3d_body
+from sam_3d_body.models.heads.contact_head import ContactHead
 from sam_3d_body.utils.config import get_config
 from damon_mhr import DamonMHRDataset
+from damon_smpl import DamonSMPLDataset
 from dataset_utils import prepare_damon_batch
 from train_contact import damon_collate
 from body_converter import BodyConverter
@@ -337,17 +339,42 @@ def main():
 
     # ---- Model ----
     print("Loading SAM-3D-Body model...")
-    model, _ = load_sam_3d_body(
+    import torch.nn as nn
+    model, model_cfg = load_sam_3d_body(
         checkpoint_path=cfg.MODEL.CHECKPOINT_PATH,
         device=args.device,
         mhr_path=cfg.MODEL.MHR_MODEL_PATH,
     )
+
+    # Reinitialize contact modules from train config (same as train_contact.py)
+    contact_cfg = cfg.MODEL.CONTACT_HEAD
+    num_vertices = contact_cfg.get('NUM_VERTICES', 18439)
+    num_kp  = contact_cfg.get('NUM_CONTACTS', 21)
+    num_gbl = contact_cfg.get('NUM_GLOBAL_TOKENS', 0)
+    total   = num_kp + num_gbl
+    dim     = model_cfg.MODEL.DECODER.DIM
+    model.num_contact_tokens        = num_kp
+    model.num_global_contact_tokens = num_gbl
+    model.total_contact_tokens      = total
+    model.contact_keypoint_indices  = list(range(num_kp))
+    model.contact_grid_size         = contact_cfg.get('GRID_SIZE', 1)
+    model.contact_grid_radius       = contact_cfg.get('GRID_RADIUS', 0.1)
+    model.contact_embedding         = nn.Embedding(total, dim).to(args.device)
+    model.head_contact              = ContactHead(
+        input_dim=dim,
+        num_contact_tokens=total,
+        num_vertices=num_vertices,
+        mlp_depth=contact_cfg.get('MLP_DEPTH', 2),
+        mlp_channel_div_factor=contact_cfg.get('MLP_CHANNEL_DIV_FACTOR', 4),
+    ).to(args.device)
 
     print(f"Loading checkpoint: {args.checkpoint}")
     ckpt = torch.load(args.checkpoint, map_location=args.device)
     state = ckpt.get("model_state_dict", ckpt)
     model.load_state_dict(state, strict=False)
     model.eval()
+
+    lod = cfg.DATASET.get('LOD', 1)
 
     # MHR mesh faces: [F, 3]  — used for 2D overlay (row 0)
     faces = model.head_pose.faces.cpu().numpy().astype(np.int32)
@@ -362,31 +389,67 @@ def main():
     smpl_template_verts = smpl_npz["v_template"].astype(np.float32)   # [6890, 3]
     smpl_faces          = smpl_npz["f"].astype(np.int32)               # [13776, 3]
 
-    # ---- Contact converter (MHR → SMPL) ----
-    print("Initialising MHR→SMPL contact converter...")
-    converter = BodyConverter(device="cpu")
+    # ---- Contact converter (MHR → SMPL, and SMPL → MHR for back-projection) ----
+    print("Initialising MHR↔SMPL contact converter...")
+    converter = BodyConverter(smpl_faces=smpl_faces, device="cpu")
 
     # ---- Dataset ----
-    # Use MHR dataset for images/bbox/cam_k.  GT contacts come from SMPL NPZ
-    # and are converted to SMPL space below.
-    data_root = cfg.DATASET.get("DATA_ROOT", None)
-    val_ratio = cfg.DATASET.get("VAL_RATIO", 0.2)
-    seed_ds   = cfg.DATASET.get("SEED", 42)
+    data_root  = cfg.DATASET.get("DATA_ROOT", None)
+    val_ratio  = cfg.DATASET.get("VAL_RATIO", 0.2)
+    seed_ds    = cfg.DATASET.get("SEED", 42)
+    lod        = cfg.DATASET.get('LOD', 1)
+    detect_npz = cfg.DATASET.get('DETECT_NPZ', {})
 
-    if args.split == "test":
-        dataset = DamonMHRDataset(
-            npz_path=cfg.DATASET.TEST_NPZ, data_root=data_root
-        )
-    elif args.split == "trainval":
-        dataset = DamonMHRDataset(
-            npz_path=cfg.DATASET.TRAINVAL_NPZ, data_root=data_root
-        )
+    # Prefer original SMPL GT (6890 verts) when SMPL NPZ paths are configured.
+    smpl_trainval = cfg.DATASET.get('SMPL_TRAINVAL_NPZ', None)
+    smpl_test     = cfg.DATASET.get('SMPL_TEST_NPZ', None)
+    use_smpl_gt   = bool(smpl_trainval or smpl_test)
+
+    if use_smpl_gt:
+        print("Using original SMPL GT contacts (DamonSMPLDataset).")
+        if args.split == "test":
+            if not smpl_test:
+                raise ValueError("DATASET.SMPL_TEST_NPZ not set in config.")
+            dataset = DamonSMPLDataset(
+                smpl_npz_path=smpl_test,
+                detect_npz_path=detect_npz.get('TEST', None),
+                data_root=data_root,
+            )
+        elif args.split == "trainval":
+            dataset = DamonSMPLDataset(
+                smpl_npz_path=smpl_trainval,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                data_root=data_root,
+            )
+        else:
+            train_ds, val_ds = DamonSMPLDataset.split_train_val(
+                smpl_npz_path=smpl_trainval,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
+            )
+            dataset = train_ds if args.split == "train" else val_ds
     else:
-        train_ds, val_ds = DamonMHRDataset.split_train_val(
-            npz_path=cfg.DATASET.TRAINVAL_NPZ,
-            val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
-        )
-        dataset = train_ds if args.split == "train" else val_ds
+        print("SMPL NPZ not configured — using MHR LOD GT with conversion.")
+        contact_npz = cfg.DATASET.CONTACT_NPZ
+        if args.split == "test":
+            dataset = DamonMHRDataset(
+                contact_npz_path=contact_npz.TEST,
+                detect_npz_path=detect_npz.get('TEST', None),
+                lod=lod, data_root=data_root,
+            )
+        elif args.split == "trainval":
+            dataset = DamonMHRDataset(
+                contact_npz_path=contact_npz.TRAINVAL,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                lod=lod, data_root=data_root,
+            )
+        else:
+            train_ds, val_ds = DamonMHRDataset.split_train_val(
+                contact_npz_path=contact_npz.TRAINVAL,
+                detect_npz_path=detect_npz.get('TRAINVAL', None),
+                lod=lod, val_ratio=val_ratio, seed=seed_ds, data_root=data_root,
+            )
+            dataset = train_ds if args.split == "train" else val_ds
 
     print(f"Dataset split='{args.split}', size={len(dataset)}")
 
@@ -410,48 +473,59 @@ def main():
             model._initialize_batch(batch)
             output = model.forward_step(batch, decoder_type="body")
 
-        # ---- Contact predictions (MHR space) ----
-        contact_logits = output["contact"]["contact_logits"]  # [1, 18439]
-        pred_probs_mhr = torch.sigmoid(contact_logits)[0].cpu().numpy()  # [18439]
-        pred_mask_mhr  = pred_probs_mhr > args.threshold                  # [18439] bool
-        gt_mask_mhr    = contact_label.numpy().astype(bool)               # [18439] bool
+        # ---- Contact predictions (LOD space) ----
+        contact_logits = output["contact"]["contact_logits"]     # [1, V_lod]
+        pred_probs_lod = torch.sigmoid(contact_logits)[0].cpu()  # [V_lod] float
 
-        # ---- Convert contacts to SMPL space (for lower-row + IoU) ----
-        pred_mask_smpl = converter.mhr_to_smpl(
-            contacts=torch.from_numpy(pred_probs_mhr).unsqueeze(0),
-            threshold=args.threshold,
-        ).contacts[0].numpy().astype(bool)                                 # [6890] bool
+        # ---- Pred: LOD_N → SMPL (Voronoi BFS + barycentric) ----
+        pred_smpl_probs = converter.mhr_lod_probs_to_smpl_probs(
+            pred_probs_lod.unsqueeze(0), source_lod=lod)              # [1, 6890]
+        pred_mask_smpl = (pred_smpl_probs[0] > args.threshold).numpy().astype(bool)  # [6890]
 
-        gt_mask_smpl = converter.mhr_to_smpl(
-            contacts=torch.from_numpy(gt_mask_mhr.astype(np.float32)).unsqueeze(0),
-            threshold=0.5,
-        ).contacts[0].numpy().astype(bool)                                 # [6890] bool
+        # ---- GT: original SMPL labels or converted from LOD_N ----
+        if use_smpl_gt:
+            # contact_label is already [6890] from DamonSMPLDataset
+            gt_mask_smpl  = contact_label.numpy().astype(bool)           # [6890]
+            gt_smpl_float = contact_label.float().unsqueeze(0)           # [1, 6890]
+        else:
+            # contact_label is [V_lod] from DamonMHRDataset — convert to SMPL
+            gt_smpl_float = converter.mhr_lod_probs_to_smpl_probs(
+                contact_label.float().unsqueeze(0), source_lod=lod)      # [1, 6890]
+            gt_mask_smpl  = (gt_smpl_float[0] > 0.5).numpy().astype(bool)  # [6890]
+
+        # ---- For 2D overlay: back-project SMPL → LOD1 ----
+        # Both rows derive from the same SMPL contacts (consistent body-part regions).
+        pred_mask_lod1 = converter.smpl_to_mhr(
+            contacts=pred_smpl_probs, threshold=args.threshold, target_lod=1,
+        ).contacts[0].numpy().astype(bool)                            # [18439]
+        gt_mask_lod1 = converter.smpl_to_mhr(
+            contacts=gt_smpl_float, threshold=0.5, target_lod=1,
+        ).contacts[0].numpy().astype(bool)                            # [18439]
 
         # ---- SMPL T-pose template for lower row ----
-        # Apply the same Y/Z-flip as was previously used for MHR T-pose verts
-        # (converts Y-up model coords to the convention expected by make_figure).
         verts_3d_tpose = smpl_template_verts.copy()
-        verts_3d_tpose[:, [1, 2]] *= -1   # [6890, 3]
+        verts_3d_tpose[:, [1, 2]] *= -1   # [6890, 3]  (Y-up → OpenCV flip)
 
-        # ---- 3D posed vertices + 2D projection ----
-        verts_3d_posed = output["mhr"]["pred_vertices"][0].cpu().numpy()     # [V, 3]
-        pred_cam_t_np  = output["mhr"]["pred_cam_t"][0].cpu().numpy()        # [3]
-        verts_3d_cam   = verts_3d_posed + pred_cam_t_np                      # [V, 3] camera space
-        verts_2d       = output["mhr"]["pred_keypoints_2d_verts"][0].cpu().numpy()  # [V, 2] pixels
+        # ---- 3D posed vertices (LOD1) + 2D projection ----
+        verts_3d_posed = output["mhr"]["pred_vertices"][0].cpu().numpy()          # [V_lod1, 3]
+        pred_cam_t_np  = output["mhr"]["pred_cam_t"][0].cpu().numpy()             # [3]
+        verts_3d_cam   = verts_3d_posed + pred_cam_t_np                           # [V_lod1, 3]
+        verts_2d       = output["mhr"]["pred_keypoints_2d_verts"][0].cpu().numpy()  # [V_lod1, 2]
 
-        # ---- IoU (SMPL space) ----
+        # ---- IoU — computed in SMPL space ----
         tp = (pred_mask_smpl & gt_mask_smpl).sum()
         fp = (pred_mask_smpl & ~gt_mask_smpl).sum()
         fn = (~pred_mask_smpl & gt_mask_smpl).sum()
         iou = float(tp) / (tp + fp + fn + 1e-8)
         ious.append(iou)
 
-        print(f"  GT contacts (SMPL):   {gt_mask_smpl.sum()}")
-        print(f"  Pred contacts (SMPL): {pred_mask_smpl.sum()}")
-        print(f"  IoU (SMPL):           {iou:.4f}")
+        gt_src = "SMPL (original)" if use_smpl_gt else f"LOD{lod}→SMPL"
+        print(f"  GT contacts (SMPL, {gt_src}): {gt_mask_smpl.sum()}")
+        print(f"  Pred contacts (SMPL):          {pred_mask_smpl.sum()}")
+        print(f"  IoU (SMPL):                    {iou:.4f}")
 
         # ---- Figure ----
-        # Row 0: 2D overlay uses MHR mesh (matches model output topology)
+        # Row 0: 2D overlay uses LOD1 mesh (pose head always outputs LOD1)
         # Row 1: 3D T-pose uses SMPL template mesh with SMPL-space contact masks
         fig = make_figure(
             image           = image_np,
@@ -459,14 +533,14 @@ def main():
             verts_2d        = verts_2d,
             verts_3d_cam    = verts_3d_cam,
             verts_3d_tpose  = verts_3d_tpose,
-            faces           = faces,            # MHR faces for 2D overlay
-            gt_mask         = gt_mask_mhr,      # MHR mask for 2D overlay
-            pred_mask       = pred_mask_mhr,    # MHR mask for 2D overlay
+            faces           = faces,              # LOD1 MHR faces for 2D overlay
+            gt_mask         = gt_mask_lod1,       # LOD1 mask for 2D overlay
+            pred_mask       = pred_mask_lod1,     # LOD1 mask for 2D overlay
             iou             = iou,
             sample_idx      = ds_idx,
-            tpose_faces     = smpl_faces,       # SMPL faces for lower row
-            tpose_gt_mask   = gt_mask_smpl,     # SMPL mask for lower row GT
-            tpose_pred_mask = pred_mask_smpl,   # SMPL mask for lower row Pred
+            tpose_faces     = smpl_faces,         # SMPL faces for lower row
+            tpose_gt_mask   = gt_mask_smpl,       # SMPL mask for lower row GT
+            tpose_pred_mask = pred_mask_smpl,     # SMPL mask for lower row Pred
         )
 
         save_path = output_dir / f"sample_{run_idx:04d}_idx{ds_idx}_iou{iou:.3f}.png"
