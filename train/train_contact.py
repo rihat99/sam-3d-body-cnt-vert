@@ -6,6 +6,9 @@ the rest of SAM-3D-Body frozen.  Each run writes to a date-time-stamped folder
 under OUTPUT.DIR so experiments are easy to track.
 """
 
+import faulthandler
+faulthandler.enable()  # print C-level stack trace on segfault
+
 import os
 import sys
 import argparse
@@ -28,8 +31,10 @@ from sam_3d_body.utils.config import get_config
 
 sys.path.insert(0, str(Path(__file__).parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "dataset"))
+sys.path.insert(0, str(Path(__file__).parent.parent / "mhr_smpl_conversion"))
 from damon_mhr import DamonMHRDataset
 from dataset_utils import prepare_damon_batch
+from body_converter import BodyConverter
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +182,7 @@ class ContactTrainer:
             pin_memory=False,
             drop_last=True,
             collate_fn=damon_collate,
+            persistent_workers=self.cfg.TRAIN.NUM_WORKERS > 0,
         )
         self.val_loader = DataLoader(
             self.val_dataset,
@@ -185,6 +191,7 @@ class ContactTrainer:
             num_workers=self.cfg.TRAIN.NUM_WORKERS,
             pin_memory=False,
             collate_fn=damon_collate,
+            persistent_workers=self.cfg.TRAIN.NUM_WORKERS > 0,
         )
 
         # ---- Positive class weight & negative class weight ----
@@ -198,6 +205,18 @@ class ContactTrainer:
             weight_decay=self.cfg.TRAIN.WEIGHT_DECAY,
         )
         self.scheduler = self._setup_scheduler()
+
+        # ---- OOB vertex weighting ----
+        self.oob_weight = self.cfg.TRAIN.get('OOB_VERTEX_WEIGHT', 1.0)
+        self.lod = self.cfg.DATASET.get('LOD', 1)
+        self.body_converter = None
+        if self.oob_weight < 1.0:
+            print(f"OOB vertex weighting enabled: out-of-bounds weight = {self.oob_weight}")
+            if self.lod != 1:
+                print(f"  Loading BodyConverter for LOD{self.lod} mapping...")
+                self.body_converter = BodyConverter(device=device)
+        else:
+            print("OOB vertex weighting disabled (OOB_VERTEX_WEIGHT=1.0)")
 
         # ---- State ----
         self.current_epoch = 0
@@ -275,7 +294,12 @@ class ContactTrainer:
     # Loss & metrics
     # ------------------------------------------------------------------
 
-    def _compute_loss(self, logits: torch.Tensor, targets: torch.Tensor):
+    def _compute_loss(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        vertex_weights: torch.Tensor = None,
+    ):
         """
         Per-vertex asymmetric binary cross-entropy.
 
@@ -283,14 +307,73 @@ class ContactTrainer:
         neg_weight scales the negative class (penalises false positives / precision).
 
         Args:
-            logits:  [B, num_vertices]
-            targets: [B, num_vertices] int64 binary
+            logits:         [B, num_vertices]
+            targets:        [B, num_vertices] int64 binary
+            vertex_weights: [B, num_vertices] float, optional per-vertex loss weights.
+                            In-bounds vertices should have weight 1.0; OOB vertices
+                            get OOB_VERTEX_WEIGHT (0.0 = ignore, 1.0 = full signal).
         """
         targets_f = targets.float()
         probs = torch.sigmoid(logits).clamp(min=1e-7, max=1 - 1e-7)
         pos_loss = -self.pos_weight * targets_f * torch.log(probs)
         neg_loss = -self.neg_weight * (1 - targets_f) * torch.log(1 - probs)
-        return (pos_loss + neg_loss).mean()
+        per_vertex_loss = pos_loss + neg_loss  # [B, num_vertices]
+        if vertex_weights is not None:
+            per_vertex_loss = per_vertex_loss * vertex_weights
+        return per_vertex_loss.mean()
+
+    @torch.no_grad()
+    def _compute_vertex_weights(self, output: dict, batch: dict) -> torch.Tensor:
+        """
+        Compute per-vertex loss weights based on whether each vertex projects
+        inside the original image bounds.
+
+        Returns [B, num_vertices] float tensor where in-bounds vertices = 1.0
+        and out-of-bounds vertices = self.oob_weight.
+        Returns None if oob_weight == 1.0 (no masking needed).
+        """
+        if self.oob_weight >= 1.0:
+            return None
+
+        mhr_out = output.get("mhr")
+        if mhr_out is None:
+            return None
+        verts_2d = mhr_out.get("pred_keypoints_2d_verts")  # [B, 18439, 2] pixel coords
+        if verts_2d is None:
+            return None
+
+        verts_2d = verts_2d.detach()  # no gradient through the weight mask
+
+        # ori_img_size is [B, 1, 2] with (H, W) ordering
+        ori_img_size = batch["ori_img_size"][:, 0].to(verts_2d.device)  # [B, 2]
+        H = ori_img_size[:, 0:1]  # [B, 1]
+        W = ori_img_size[:, 1:2]  # [B, 1]
+
+        # Compute LOD1-level visibility: 1.0 = inside image, 0.0 = OOB
+        oob_lod1 = (
+            (verts_2d[..., 0] < 0)
+            | (verts_2d[..., 0] > W)
+            | (verts_2d[..., 1] < 0)
+            | (verts_2d[..., 1] > H)
+        )  # [B, 18439] bool
+        visible_lod1 = (~oob_lod1).float()  # [B, 18439]
+
+        # Downsample to target LOD if needed
+        if self.lod == 1:
+            visible = visible_lod1
+        else:
+            # Barycentric interpolation LOD1 → LOD_N via BodyConverter
+            visible_float = self.body_converter._apply_lod_mapping_contacts(
+                visible_lod1.to(self.body_converter._device), target_lod=self.lod
+            ).to(verts_2d.device)
+            # A LOD_N vertex is visible if >50% of its LOD1 constituents are visible
+            visible = (visible_float > 0.5).float()
+
+        # vertex_weights: 1.0 for visible, oob_weight for OOB
+        vertex_weights = visible + (1.0 - visible) * self.oob_weight  # [B, num_vertices]
+
+        oob_frac = 1.0 - visible.mean().item()
+        return vertex_weights, oob_frac
 
     @torch.no_grad()
     def _compute_metrics(self, logits: torch.Tensor, targets: torch.Tensor) -> dict:
@@ -346,7 +429,10 @@ class ContactTrainer:
                 )
 
             logits = output["contact"]["contact_logits"]  # [B, num_vertices]
-            loss = self._compute_loss(logits, contact_labels)
+            vw_result = self._compute_vertex_weights(output, batch)
+            vertex_weights, oob_frac = vw_result if vw_result is not None else (None, 0.0)
+            loss = self._compute_loss(logits, contact_labels, vertex_weights)
+            metrics = self._compute_metrics(logits, contact_labels)
 
             self.optimizer.zero_grad()
             loss.backward()
@@ -365,8 +451,6 @@ class ContactTrainer:
                         print(f"  {name}: {status}")
                 print("=" * 40 + "\n")
 
-            metrics = self._compute_metrics(logits, contact_labels)
-
             total_loss += loss.item()
             for k in total_metrics:
                 total_metrics[k] += metrics[k]
@@ -378,6 +462,8 @@ class ContactTrainer:
                 self.writer.add_scalar('train/iou', metrics['iou'], self.global_step)
                 self.writer.add_scalar('train/f1', metrics['f1'], self.global_step)
                 self.writer.add_scalar('train/lr', self.optimizer.param_groups[0]['lr'], self.global_step)
+                if oob_frac > 0.0:
+                    self.writer.add_scalar('train/oob_vertex_frac', oob_frac, self.global_step)
 
             self.global_step += 1
 
@@ -402,7 +488,9 @@ class ContactTrainer:
             output = self.model.forward_step(batch, decoder_type="body")
             logits = output["contact"]["contact_logits"]
 
-            loss = self._compute_loss(logits, contact_labels)
+            vw_result = self._compute_vertex_weights(output, batch)
+            vertex_weights = vw_result[0] if vw_result is not None else None
+            loss = self._compute_loss(logits, contact_labels, vertex_weights)
             metrics = self._compute_metrics(logits, contact_labels)
 
             total_loss += loss.item()

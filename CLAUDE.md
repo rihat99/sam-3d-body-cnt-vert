@@ -21,7 +21,7 @@ pip install 'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' --n
 
 Use this python to run code in terminal
 ```
-PYTHON=/data3/rikhat.akizhanov/miniconda3/envs/sam3d/bin/python
+PYTHON=/data3/rikhat.akizhanov/miniconda3/envs/mhr/bin/python
 ```
 
 **Train contact head:**

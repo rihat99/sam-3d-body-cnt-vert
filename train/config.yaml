@@ -30,8 +30,8 @@ MODEL:
     # Extra global token(s) not updated with image features (0 = off)
     NUM_GLOBAL_TOKENS: 1
     # 18439 MHR mesh vertices
-    # NUM_VERTICES: 18439
-    NUM_VERTICES: 595
+    NUM_VERTICES: 18439
+    # NUM_VERTICES: 595
     MLP_DEPTH: 2
     MLP_CHANNEL_DIV_FACTOR: 1
     # K×K grid sampling around each keypoint (1 = original single-point)
@@ -76,13 +76,15 @@ TRAIN:
   SAVE_FREQ: 5
   VAL_FREQ: 1
   RESUME: null
+  # Weight applied to out-of-bounds vertices in the loss (0.0 = ignore, 1.0 = treat as visible).
+  OOB_VERTEX_WEIGHT: 1.0
 DATASET:
   # MHR LOD level (0–6). Determines vertex count for contact labels.
-  LOD: 6
+  LOD: 1
   # Contact NPZ files (imgname + contact_label); LOD-specific.
   CONTACT_NPZ:
-    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_contact_lod6.npz
-    TEST: ./dataset/damon_mhr_contact/hot_dca_test_contact_lod6.npz
+    TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_contact_lod1.npz
+    TEST: ./dataset/damon_mhr_contact/hot_dca_test_contact_lod1.npz
   # Detect NPZ files (imgname + bbox + cam_k); LOD-independent.
   DETECT_NPZ:
     TRAINVAL: ./dataset/damon_mhr_contact/hot_dca_trainval_detect.npz
